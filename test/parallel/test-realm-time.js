@@ -75,6 +75,7 @@ function onceLine(stream) {
           token: request.headers['x-rex-realm-token'],
           generation: request.headers['x-rex-realm-generation'],
           workerPid: request.headers['x-rex-realm-worker-pid'],
+          controlTid: request.headers['x-rex-realm-control-tid'],
           request: JSON.parse(body),
           functionDurationMs: 4,
           timelineAdjustmentMs: 1,
@@ -103,6 +104,9 @@ function onceLine(stream) {
   assert.strictEqual(envelope.generation,
                      String(realmTime.getState(null).generation));
   assert.strictEqual(envelope.workerPid, String(process.pid));
+  if (process.platform === 'win32') {
+    assert(Number(envelope.controlTid) > 0);
+  }
   assert.strictEqual(envelope.request.method, 'Runtime.evaluate');
   realmTime.commitExternalCall(
     null,

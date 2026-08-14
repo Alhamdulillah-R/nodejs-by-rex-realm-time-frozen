@@ -99,11 +99,14 @@ the response to 64 MiB, and sends these control headers:
 * `X-Rex-Realm-Token`
 * `X-Rex-Realm-Generation`
 * `X-Rex-Realm-Worker-Pid`
+* `X-Rex-Realm-Control-Tid` (Windows)
 
 Only the loopback host is reachable through this binding. The Worker main V8
 thread remains blocked in native connect/send/receive until the response is in
-memory. JavaScript parses the envelope and commits before returning the result
-to sandbox code.
+memory. On Windows its thread ID lets the Controller suspend every other Worker
+thread while leaving only this non-JavaScript socket-drain path runnable; the
+Controller resumes those threads before closing the response. JavaScript then
+parses the envelope and commits before returning the result to sandbox code.
 
 ## Duration contract
 

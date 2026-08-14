@@ -19,6 +19,7 @@
 
 #ifdef _WIN32
 #include <winsock2.h>
+#include <windows.h>
 #else
 #include <arpa/inet.h>
 #include <netinet/in.h>
@@ -482,6 +483,11 @@ void RequestExternalCallBinding(const FunctionCallbackInfo<Value>& args) {
   request.append("X-Rex-Realm-Worker-Pid: ")
       .append(std::to_string(uv_os_getpid()))
       .append("\r\n");
+#ifdef _WIN32
+  request.append("X-Rex-Realm-Control-Tid: ")
+      .append(std::to_string(GetCurrentThreadId()))
+      .append("\r\n");
+#endif
   request.append("Content-Length: ")
       .append(std::to_string(body.size()))
       .append("\r\n\r\n")
