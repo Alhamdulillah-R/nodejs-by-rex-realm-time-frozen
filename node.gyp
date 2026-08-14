@@ -152,6 +152,7 @@
       'src/node_process_methods.cc',
       'src/node_process_object.cc',
       'src/node_realm.cc',
+      'src/node_realm_time.cc',
       'src/node_report.cc',
       'src/node_report_module.cc',
       'src/node_report_utils.cc',

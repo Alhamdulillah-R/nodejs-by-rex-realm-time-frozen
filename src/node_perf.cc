@@ -7,6 +7,7 @@
 #include "node_external_reference.h"
 #include "node_internals.h"
 #include "node_process-inl.h"
+#include "node_realm_time.h"
 #include "util-inl.h"
 
 #include <cinttypes>
@@ -312,17 +313,24 @@ void MarkBootstrapComplete(const FunctionCallbackInfo<Value>& args) {
       performance::NODE_PERFORMANCE_MILESTONE_BOOTSTRAP_COMPLETE);
 }
 
-static double PerformanceNowImpl() {
-  return static_cast<double>(uv_hrtime() - performance_process_start) /
+static double PerformanceNowImpl(Isolate* isolate) {
+  const uint64_t real_now = uv_hrtime();
+  realm_time::RealmTimeController* controller =
+      realm_time::GetCurrentController(isolate);
+  const double observable_now =
+      controller == nullptr
+          ? static_cast<double>(real_now)
+          : controller->CurrentMonotonicTimeNanoseconds(real_now);
+  return (observable_now - static_cast<double>(performance_process_start)) /
          NANOS_PER_MILLIS;
 }
 
 static double FastPerformanceNow(v8::Local<v8::Value> receiver) {
-  return PerformanceNowImpl();
+  return PerformanceNowImpl(Isolate::GetCurrent());
 }
 
 static void SlowPerformanceNow(const FunctionCallbackInfo<Value>& args) {
-  args.GetReturnValue().Set(PerformanceNowImpl());
+  args.GetReturnValue().Set(PerformanceNowImpl(args.GetIsolate()));
 }
 
 static v8::CFunction fast_performance_now(

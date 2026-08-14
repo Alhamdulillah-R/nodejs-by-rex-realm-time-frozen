@@ -253,6 +253,11 @@ int uv_loop_init(uv_loop_t* loop) {
    * to zero before calling uv_update_time for the first time.
    */
   loop->time = 0;
+  loop->realm_time_last_real = 0;
+  loop->realm_time_fraction_ms = 0;
+  loop->realm_time_owner = NULL;
+  loop->realm_time_enabled = 0;
+  loop->realm_time_frozen = 0;
   uv_update_time(loop);
 
   uv__queue_init(&loop->wq);
@@ -324,8 +329,7 @@ fail_metrics_mutex_init:
 
 void uv_update_time(uv_loop_t* loop) {
   uint64_t new_time = uv__hrtime(1000);
-  assert(new_time >= loop->time);
-  loop->time = new_time;
+  uv__realm_time_update(loop, new_time);
 }
 
 

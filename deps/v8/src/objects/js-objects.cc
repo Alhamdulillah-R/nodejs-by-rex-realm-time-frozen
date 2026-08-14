@@ -5829,7 +5829,15 @@ int64_t JSDate::CurrentTimeValue(Isolate* isolate) {
   // the number in a Date object representing a particular instant in
   // time is milliseconds. Therefore, we floor the result of getting
   // the OS time.
-  return V8::GetCurrentPlatform()->CurrentClockTimeMilliseconds();
+  int64_t current_time =
+      V8::GetCurrentPlatform()->CurrentClockTimeMilliseconds();
+  CurrentTimeMillisCallback callback =
+      isolate->current_time_millis_callback();
+  if (callback != nullptr) {
+    current_time =
+        callback(reinterpret_cast<v8::Isolate*>(isolate), current_time);
+  }
+  return current_time;
 }
 
 // static

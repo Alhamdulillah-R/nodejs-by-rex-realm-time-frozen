@@ -317,6 +317,15 @@ UV_EXTERN int uv_has_ref(const uv_handle_t*);
 UV_EXTERN void uv_update_time(uv_loop_t*);
 UV_EXTERN uint64_t uv_now(const uv_loop_t*);
 
+/* RexMirrorRealm process-wide logical timer clock. */
+UV_EXTERN int uv_realm_time_enable(uv_loop_t* loop, const void* owner);
+UV_EXTERN int uv_realm_time_disable(uv_loop_t* loop, const void* owner);
+UV_EXTERN int uv_realm_time_freeze(uv_loop_t* loop, const void* owner);
+UV_EXTERN int uv_realm_time_resume(uv_loop_t* loop,
+                                    const void* owner,
+                                    double advance_ms);
+UV_EXTERN int uv_realm_time_is_frozen(const uv_loop_t* loop);
+
 UV_EXTERN int uv_backend_fd(const uv_loop_t*);
 UV_EXTERN int uv_backend_timeout(const uv_loop_t*);
 
@@ -1952,6 +1961,12 @@ struct uv_loop_s {
   void* internal_fields;
   /* Internal flag to signal loop stop. */
   unsigned int stop_flag;
+  /* RexMirrorRealm logical timer-clock state. */
+  uint64_t realm_time_last_real;
+  double realm_time_fraction_ms;
+  const void* realm_time_owner;
+  unsigned int realm_time_enabled;
+  unsigned int realm_time_frozen;
   UV_LOOP_PRIVATE_FIELDS
 };
 

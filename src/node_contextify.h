@@ -7,6 +7,7 @@
 #include "cppgc_helpers-inl.h"
 #include "node_context_data.h"
 #include "node_errors.h"
+#include "node_realm_time.h"
 
 namespace node {
 class ExternalReferenceRegistry;
@@ -125,6 +126,10 @@ class ContextifyContext final : CPPGC_MIXIN(ContextifyContext) {
     return microtask_queue_.get();
   }
 
+  inline realm_time::RealmTimeController* realm_time_controller() {
+    return &realm_time_controller_;
+  }
+
   template <typename T>
   static ContextifyContext* Get(const v8::PropertyCallbackInfo<T>& args);
   static ContextifyContext* Get(v8::Local<v8::Object> object);
@@ -187,6 +192,7 @@ class ContextifyContext final : CPPGC_MIXIN(ContextifyContext) {
 
   v8::TracedReference<v8::Context> context_;
   std::unique_ptr<v8::MicrotaskQueue> microtask_queue_;
+  realm_time::RealmTimeController realm_time_controller_;
 };
 
 class ContextifyScript final : CPPGC_MIXIN(ContextifyScript) {

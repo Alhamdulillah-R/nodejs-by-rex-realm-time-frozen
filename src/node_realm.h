@@ -9,6 +9,7 @@
 #include "cppgc_helpers.h"
 #include "env_properties.h"
 #include "memory_tracker.h"
+#include "node_realm_time.h"
 #include "node_snapshotable.h"
 
 namespace node {
@@ -123,6 +124,9 @@ class Realm : public MemoryRetainer {
   inline Kind kind() const;
   inline virtual v8::Local<v8::Context> context() const;
   inline bool has_run_bootstrapping_code() const;
+  inline realm_time::RealmTimeController* realm_time_controller() {
+    return &realm_time_controller_;
+  }
 
   // Methods created using SetMethod(), SetPrototypeMethod(), etc. inside
   // this scope can access the created T* object using
@@ -204,6 +208,7 @@ class Realm : public MemoryRetainer {
   int64_t base_object_created_by_bootstrap_ = 0;
 
   BindingDataStore binding_data_store_;
+  realm_time::RealmTimeController realm_time_controller_;
 
   BaseObjectList base_object_list_;
   CppgcWrapperList cppgc_wrapper_list_;

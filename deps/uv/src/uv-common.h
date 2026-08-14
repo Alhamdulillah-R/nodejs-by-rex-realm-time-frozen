@@ -55,6 +55,8 @@ extern int snprintf(char*, size_t, const char*, ...);
 #define ARRAY_SIZE(a) (sizeof(a) / sizeof((a)[0]))
 #define ARRAY_END(a)  ((a) + ARRAY_SIZE(a))
 
+void uv__realm_time_update(uv_loop_t* loop, uint64_t real_time_ms);
+
 #define container_of(ptr, type, member) \
   ((type *) ((char *) (ptr) - offsetof(type, member)))
 

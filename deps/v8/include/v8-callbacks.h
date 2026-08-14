@@ -6,6 +6,7 @@
 #define INCLUDE_V8_ISOLATE_CALLBACKS_H_
 
 #include <stddef.h>
+#include <stdint.h>
 
 #include <functional>
 #include <string>
@@ -190,6 +191,18 @@ enum GCCallbackFlags {
 using GCCallback = void (*)(GCType type, GCCallbackFlags flags);
 
 using InterruptCallback = void (*)(Isolate* isolate, void* data);
+
+/**
+ * Allows an embedder to replace the wall-clock value observed by ECMAScript
+ * Date operations for the currently entered Context.
+ *
+ * The callback receives the unmodified platform time in milliseconds and must
+ * return the time that is observable by JavaScript. It must not execute
+ * JavaScript. Passing nullptr to Isolate::SetCurrentTimeMillisCallback restores
+ * the platform clock.
+ */
+using CurrentTimeMillisCallback = int64_t (*)(Isolate* isolate,
+                                               int64_t real_time_millis);
 
 using PrintCurrentStackTraceFilterCallback =
     bool (*)(Isolate* isolate, Local<String> script_name);

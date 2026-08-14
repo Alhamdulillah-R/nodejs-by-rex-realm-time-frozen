@@ -493,6 +493,7 @@ using DebugObjectCache = std::vector<Handle<HeapObject>>;
   V(FatalErrorCallback, exception_behavior, nullptr)                        \
   V(OOMErrorCallbackWithData, oom_behavior, nullptr)                        \
   V(void*, oom_callback_data, nullptr)                                      \
+  V(CurrentTimeMillisCallback, current_time_millis_callback, nullptr)       \
   V(LogEventCallback, event_logger, nullptr)                                \
   V(ModifyCodeGenerationFromStringsCallback2, modify_code_gen_callback,     \
     nullptr)                                                                \

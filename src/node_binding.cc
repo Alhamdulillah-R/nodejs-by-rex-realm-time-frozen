@@ -75,6 +75,7 @@
   V(pipe_wrap)                                                                 \
   V(process_wrap)                                                              \
   V(process_methods)                                                           \
+  V(realm_time)                                                                \
   V(report)                                                                    \
   V(sea)                                                                       \
   V(serdes)                                                                    \

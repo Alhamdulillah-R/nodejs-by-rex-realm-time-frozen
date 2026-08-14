@@ -784,6 +784,14 @@ class V8_EXPORT Isolate {
       AbortOnUncaughtExceptionCallback callback);
 
   /**
+   * Installs an embedder time source used by ECMAScript Date operations. The
+   * callback is invoked with the real platform time and may return a
+   * Context-specific virtual time. Passing nullptr restores the platform
+   * clock.
+   */
+  void SetCurrentTimeMillisCallback(CurrentTimeMillisCallback callback);
+
+  /**
    * This specifies the callback called by the upcoming dynamic
    * import() language feature to load modules.
    */

@@ -10870,6 +10870,9 @@ size_t Isolate::CopyCodePages(size_t capacity, MemoryRange* code_pages_out) {
   }
 
 CALLBACK_SETTER(FatalErrorHandler, FatalErrorCallback, exception_behavior)
+CALLBACK_SETTER(CurrentTimeMillisCallback,
+                CurrentTimeMillisCallback,
+                current_time_millis_callback)
 CALLBACK_SETTER(ModifyCodeGenerationFromStringsCallback,
                 ModifyCodeGenerationFromStringsCallback2,
                 modify_code_gen_callback)

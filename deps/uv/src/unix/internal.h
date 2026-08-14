@@ -467,7 +467,7 @@ void uv__fsevents_loop_delete(uv_loop_t* loop);
 UV_UNUSED(static void uv__update_time(uv_loop_t* loop)) {
   /* Use a fast time source if available.  We only need millisecond precision.
    */
-  loop->time = uv__hrtime(UV_CLOCK_FAST) / 1000000;
+  uv__realm_time_update(loop, uv__hrtime(UV_CLOCK_FAST) / 1000000);
 }
 
 UV_UNUSED(static const char* uv__basename_r(const char* path)) {

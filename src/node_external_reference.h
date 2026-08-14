@@ -95,6 +95,7 @@ class ExternalReferenceRegistry {
   V(process_methods)                                                           \
   V(process_object)                                                            \
   V(process_wrap)                                                              \
+  V(realm_time)                                                                \
   V(report)                                                                    \
   V(task_queue)                                                                \
   V(tcp_wrap)                                                                  \
