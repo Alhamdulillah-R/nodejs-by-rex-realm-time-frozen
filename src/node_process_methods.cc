@@ -291,12 +291,8 @@ static void Uptime(const FunctionCallbackInfo<Value>& args) {
 
   uv_update_time(env->event_loop());
   const uint64_t real_now = uv_hrtime();
-  realm_time::RealmTimeController* controller =
-      realm_time::GetCurrentController(env->isolate());
   const double observable_now =
-      controller == nullptr
-          ? static_cast<double>(real_now)
-          : controller->CurrentMonotonicTimeNanoseconds(real_now);
+      realm_time::CurrentMonotonicTimeNanoseconds(real_now);
   double uptime = observable_now - per_process::node_start_time;
   Local<Number> result = Number::New(env->isolate(), uptime / NANOS_PER_SEC);
   args.GetReturnValue().Set(result);
@@ -723,13 +719,8 @@ void BindingData::MemoryInfo(MemoryTracker* tracker) const {
 // The third entry contains the remaining nanosecond part of the value.
 void BindingData::HrtimeImpl(BindingData* receiver) {
   const uint64_t real_now = uv_hrtime();
-  realm_time::RealmTimeController* controller =
-      realm_time::GetCurrentController(receiver->realm()->isolate());
-  const uint64_t t = controller == nullptr
-                         ? real_now
-                         : static_cast<uint64_t>(
-                               controller->CurrentMonotonicTimeNanoseconds(
-                                   real_now));
+  const uint64_t t = static_cast<uint64_t>(
+      realm_time::CurrentMonotonicTimeNanoseconds(real_now));
   receiver->hrtime_buffer_[0] = (t / NANOS_PER_SEC) >> 32;
   receiver->hrtime_buffer_[1] = (t / NANOS_PER_SEC) & 0xffffffff;
   receiver->hrtime_buffer_[2] = t % NANOS_PER_SEC;
@@ -737,13 +728,8 @@ void BindingData::HrtimeImpl(BindingData* receiver) {
 
 void BindingData::HrtimeBigIntImpl(BindingData* receiver) {
   const uint64_t real_now = uv_hrtime();
-  realm_time::RealmTimeController* controller =
-      realm_time::GetCurrentController(receiver->realm()->isolate());
-  const uint64_t t = controller == nullptr
-                         ? real_now
-                         : static_cast<uint64_t>(
-                               controller->CurrentMonotonicTimeNanoseconds(
-                                   real_now));
+  const uint64_t t = static_cast<uint64_t>(
+      realm_time::CurrentMonotonicTimeNanoseconds(real_now));
   // The buffer is a Uint32Array, so we need to reinterpret it as a
   // Uint64Array to write the value. The buffer is valid at this scope so we
   // can safely cast away the constness.

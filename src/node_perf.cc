@@ -313,14 +313,10 @@ void MarkBootstrapComplete(const FunctionCallbackInfo<Value>& args) {
       performance::NODE_PERFORMANCE_MILESTONE_BOOTSTRAP_COMPLETE);
 }
 
-static double PerformanceNowImpl(Isolate* isolate) {
+static double PerformanceNowImpl(Isolate*) {
   const uint64_t real_now = uv_hrtime();
-  realm_time::RealmTimeController* controller =
-      realm_time::GetCurrentController(isolate);
   const double observable_now =
-      controller == nullptr
-          ? static_cast<double>(real_now)
-          : controller->CurrentMonotonicTimeNanoseconds(real_now);
+      realm_time::CurrentMonotonicTimeNanoseconds(real_now);
   return (observable_now - static_cast<double>(performance_process_start)) /
          NANOS_PER_MILLIS;
 }

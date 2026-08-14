@@ -190,7 +190,8 @@ function onceLine(stream) {
   assert(performance.now() - timerBase >= 20);
   realmTime.disable(null);
 
-  // vm contexts in one Isolate have independent controllers.
+  // A Realm owns the whole Node process.  Every context and Worker isolate
+  // reads the active process clock; a second principal cannot be enabled.
   const first = vm.createContext(Object.create(null));
   const second = vm.createContext(Object.create(null));
   first.performance = performance;
@@ -210,10 +211,14 @@ function onceLine(stream) {
   assert.strictEqual(vm.runInContext('Date.now()', first), firstFrozen);
   assert.strictEqual(
     vm.runInContext('performance.now()', first), firstPerformanceFrozen);
-  assert(vm.runInContext('Date.now()', second) - secondBefore >= 30);
-  assert(vm.runInContext('performance.now()', second) -
-         secondPerformanceBefore >= 30);
+  assert.strictEqual(vm.runInContext('Date.now()', second), secondBefore);
+  assert.strictEqual(
+    vm.runInContext('performance.now()', second), secondPerformanceBefore);
   realmTime.commitExternalCall(first, firstToken, 2.25);
+  assert.throws(
+    () => realmTime.enable(second),
+    /different Realm time controller/);
+  assert.strictEqual(realmTime.isEnabled(second), false);
 
   // Nested calls are LIFO transactions and committed durations accumulate.
   const nestedBase = vm.runInContext('Date.now()', first);

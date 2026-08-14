@@ -44,6 +44,7 @@ class RealmTimeController final {
                              uint64_t real_monotonic_time_ns,
                              std::string operation);
   TransactionResult ParkExternalCall(uint64_t token);
+  TransactionResult RequireReleaseExternalCall(uint64_t token);
   TransactionResult CommitExternalCall(uint64_t token,
                                        double function_duration_ms,
                                        double timeline_adjustment_ms,
@@ -53,18 +54,30 @@ class RealmTimeController final {
                                        double real_wall_time_ms,
                                        uint64_t real_monotonic_time_ns);
   TransactionResult ValidateReleaseExternalCall(uint64_t token) const;
+  TransactionResult FinalizeReleaseExternalCall(
+      uint64_t token,
+      double real_wall_time_ms,
+      uint64_t real_monotonic_time_ns);
 
   double CurrentWallTimeMilliseconds(double real_wall_time_ms) const;
   double CurrentMonotonicTimeNanoseconds(uint64_t real_monotonic_time_ns) const;
 
   bool enabled() const { return enabled_; }
-  bool frozen() const { return !frames_.empty(); }
+  bool frozen() const {
+    return !frames_.empty() || pending_release_token_ != kInvalidToken;
+  }
   size_t depth() const { return frames_.size(); }
   uint64_t generation() const { return generation_; }
-  bool parked() const { return !frames_.empty() && frames_.back().parked; }
+  bool parked() const {
+    return pending_release_token_ != kInvalidToken ||
+           (!frames_.empty() && frames_.back().parked);
+  }
+  bool release_pending() const {
+    return pending_release_token_ != kInvalidToken;
+  }
   const std::string& active_operation() const;
   uint64_t active_token() const {
-    return frames_.empty() ? kInvalidToken : frames_.back().token;
+    return frames_.empty() ? pending_release_token_ : frames_.back().token;
   }
 
  private:
@@ -72,6 +85,7 @@ class RealmTimeController final {
     uint64_t token;
     std::string operation;
     bool parked = false;
+    bool release_required = false;
     double committed_duration_ms = 0;
   };
 
@@ -106,10 +120,18 @@ class RealmTimeController final {
   double frozen_monotonic_time_ns_ = 0;
   std::vector<ExternalCallFrame> frames_;
   std::vector<CompletedCall> completed_calls_;
+  uint64_t pending_release_token_ = kInvalidToken;
+  double pending_release_duration_ms_ = 0;
 };
 
 RealmTimeController* GetController(v8::Local<v8::Context> context);
 RealmTimeController* GetCurrentController(v8::Isolate* isolate);
+
+// Process-wide target clock accessors.  These deliberately do not require a
+// current vm.Context so Worker bootstrap/native callbacks share the Realm
+// timeline before and outside ordinary JavaScript context entry.
+double CurrentWallTimeMilliseconds(double real_wall_time_ms);
+double CurrentMonotonicTimeNanoseconds(uint64_t real_monotonic_time_ns);
 
 void InstallTimeSourceCallback(v8::Isolate* isolate);
 void UninstallTimeSourceCallback(v8::Isolate* isolate);

@@ -24,6 +24,7 @@
 
 #include <assert.h>
 #include <errno.h>
+#include <math.h>
 #include <stdarg.h>
 #include <stddef.h> /* NULL */
 #include <stdio.h>
@@ -847,6 +848,33 @@ static uv_loop_t default_loop_struct;
 static uv_loop_t* default_loop_ptr;
 
 
+/*
+ * Realm time is a process clock, not a loop clock.  A Node Worker owns a
+ * separate uv_loop_t, but it is still part of the same Realm process and must
+ * observe the same frozen timer timeline.  Keep the owner and projection in a
+ * single process-wide state, then project every loop's cached `time` from it.
+ */
+static uv_once_t uv__realm_time_once = UV_ONCE_INIT;
+static uv_mutex_t uv__realm_time_mutex;
+static const void* uv__realm_time_owner;
+static int uv__realm_time_enabled;
+static int uv__realm_time_frozen;
+static double uv__realm_time_offset_ms;
+static double uv__realm_time_frozen_ms;
+
+
+static void uv__realm_time_init_once(void) {
+  if (uv_mutex_init(&uv__realm_time_mutex) != 0)
+    abort();
+}
+
+
+static void uv__realm_time_lock(void) {
+  uv_once(&uv__realm_time_once, uv__realm_time_init_once);
+  uv_mutex_lock(&uv__realm_time_mutex);
+}
+
+
 uv_loop_t* uv_default_loop(void) {
   if (default_loop_ptr != NULL)
     return default_loop_ptr;
@@ -860,37 +888,52 @@ uv_loop_t* uv_default_loop(void) {
 
 
 void uv__realm_time_update(uv_loop_t* loop, uint64_t real_time_ms) {
-  uint64_t elapsed;
+  double projected_ms;
 
-  if (!loop->realm_time_enabled) {
+  uv__realm_time_lock();
+  if (uv__realm_time_enabled) {
+    projected_ms = uv__realm_time_frozen
+        ? uv__realm_time_frozen_ms
+        : (double) real_time_ms + uv__realm_time_offset_ms;
+    if (projected_ms < 0)
+      projected_ms = 0;
+    if (projected_ms > (double) UINT64_MAX)
+      projected_ms = (double) UINT64_MAX;
+    loop->time = (uint64_t) projected_ms;
+  } else {
     loop->time = real_time_ms;
-    loop->realm_time_last_real = real_time_ms;
-    return;
   }
-
-  if (real_time_ms < loop->realm_time_last_real)
-    elapsed = 0;
-  else
-    elapsed = real_time_ms - loop->realm_time_last_real;
-
   loop->realm_time_last_real = real_time_ms;
-  if (!loop->realm_time_frozen)
-    loop->time += elapsed;
+  uv_mutex_unlock(&uv__realm_time_mutex);
 }
 
 
 int uv_realm_time_enable(uv_loop_t* loop, const void* owner) {
+  uint64_t real_time_ms;
+
   if (loop == NULL || owner == NULL)
     return UV_EINVAL;
-  if (loop->realm_time_enabled && loop->realm_time_owner != owner)
-    return UV_EBUSY;
 
   uv_update_time(loop);
+  real_time_ms = uv_hrtime() / 1000000;
+  uv__realm_time_lock();
+  if (uv__realm_time_enabled && uv__realm_time_owner != owner) {
+    uv_mutex_unlock(&uv__realm_time_mutex);
+    return UV_EBUSY;
+  }
+
+  uv__realm_time_owner = owner;
+  uv__realm_time_enabled = 1;
+  uv__realm_time_frozen = 0;
+  uv__realm_time_offset_ms = (double) loop->time - (double) real_time_ms;
+  uv__realm_time_frozen_ms = 0;
+  uv_mutex_unlock(&uv__realm_time_mutex);
+
   loop->realm_time_owner = owner;
   loop->realm_time_enabled = 1;
   loop->realm_time_frozen = 0;
   loop->realm_time_fraction_ms = 0;
-  loop->realm_time_last_real = uv_hrtime() / 1000000;
+  loop->realm_time_last_real = real_time_ms;
   return 0;
 }
 
@@ -898,8 +941,18 @@ int uv_realm_time_enable(uv_loop_t* loop, const void* owner) {
 int uv_realm_time_disable(uv_loop_t* loop, const void* owner) {
   if (loop == NULL || owner == NULL)
     return UV_EINVAL;
-  if (!loop->realm_time_enabled || loop->realm_time_owner != owner)
+
+  uv__realm_time_lock();
+  if (!uv__realm_time_enabled || uv__realm_time_owner != owner) {
+    uv_mutex_unlock(&uv__realm_time_mutex);
     return UV_EPERM;
+  }
+  uv__realm_time_enabled = 0;
+  uv__realm_time_frozen = 0;
+  uv__realm_time_offset_ms = 0;
+  uv__realm_time_frozen_ms = 0;
+  uv__realm_time_owner = NULL;
+  uv_mutex_unlock(&uv__realm_time_mutex);
 
   loop->realm_time_enabled = 0;
   loop->realm_time_frozen = 0;
@@ -911,13 +964,26 @@ int uv_realm_time_disable(uv_loop_t* loop, const void* owner) {
 
 
 int uv_realm_time_freeze(uv_loop_t* loop, const void* owner) {
-  if (loop == NULL || owner == NULL || !loop->realm_time_enabled ||
-      loop->realm_time_owner != owner)
-    return UV_EINVAL;
-  if (loop->realm_time_frozen)
-    return UV_EBUSY;
+  double real_time_ms;
 
-  uv_update_time(loop);
+  if (loop == NULL || owner == NULL)
+    return UV_EINVAL;
+
+  real_time_ms = (double) (uv_hrtime() / 1000000);
+  uv__realm_time_lock();
+  if (!uv__realm_time_enabled || uv__realm_time_owner != owner) {
+    uv_mutex_unlock(&uv__realm_time_mutex);
+    return UV_EINVAL;
+  }
+  if (uv__realm_time_frozen) {
+    uv_mutex_unlock(&uv__realm_time_mutex);
+    return UV_EBUSY;
+  }
+  uv__realm_time_frozen_ms = real_time_ms + uv__realm_time_offset_ms;
+  uv__realm_time_frozen = 1;
+  loop->time = (uint64_t) uv__realm_time_frozen_ms;
+  uv_mutex_unlock(&uv__realm_time_mutex);
+
   loop->realm_time_frozen = 1;
   return 0;
 }
@@ -926,33 +992,50 @@ int uv_realm_time_freeze(uv_loop_t* loop, const void* owner) {
 int uv_realm_time_resume(uv_loop_t* loop,
                          const void* owner,
                          double advance_ms) {
-  double total;
-  uint64_t whole_ms;
+  double real_time_ms;
+  double resumed_time_ms;
 
-  if (loop == NULL || owner == NULL || !loop->realm_time_enabled ||
-      loop->realm_time_owner != owner || !loop->realm_time_frozen ||
-      advance_ms < 0 || advance_ms != advance_ms)
+  if (loop == NULL || owner == NULL || advance_ms < 0 ||
+      !isfinite(advance_ms))
     return UV_EINVAL;
 
-  total = loop->realm_time_fraction_ms + advance_ms;
-  if (total > (double) UINT64_MAX)
+  real_time_ms = (double) (uv_hrtime() / 1000000);
+  uv__realm_time_lock();
+  if (!uv__realm_time_enabled || uv__realm_time_owner != owner ||
+      !uv__realm_time_frozen) {
+    uv_mutex_unlock(&uv__realm_time_mutex);
+    return UV_EINVAL;
+  }
+  resumed_time_ms = uv__realm_time_frozen_ms + advance_ms;
+  if (!isfinite(resumed_time_ms) || resumed_time_ms < 0 ||
+      resumed_time_ms > (double) UINT64_MAX) {
+    uv_mutex_unlock(&uv__realm_time_mutex);
     return UV_EOVERFLOW;
-  whole_ms = (uint64_t) total;
-  if (UINT64_MAX - loop->time < whole_ms)
-    return UV_EOVERFLOW;
+  }
 
-  loop->time += whole_ms;
-  loop->realm_time_fraction_ms = total - whole_ms;
-  loop->realm_time_last_real = uv_hrtime() / 1000000;
+  uv__realm_time_offset_ms = resumed_time_ms - real_time_ms;
+  uv__realm_time_frozen_ms = 0;
+  uv__realm_time_frozen = 0;
+  loop->time = (uint64_t) resumed_time_ms;
+  uv_mutex_unlock(&uv__realm_time_mutex);
+
+  loop->realm_time_fraction_ms =
+      resumed_time_ms - (double) ((uint64_t) resumed_time_ms);
+  loop->realm_time_last_real = (uint64_t) real_time_ms;
   loop->realm_time_frozen = 0;
   return 0;
 }
 
 
 int uv_realm_time_is_frozen(const uv_loop_t* loop) {
+  int frozen;
+
   if (loop == NULL)
     return 0;
-  return loop->realm_time_enabled && loop->realm_time_frozen;
+  uv__realm_time_lock();
+  frozen = uv__realm_time_enabled && uv__realm_time_frozen;
+  uv_mutex_unlock(&uv__realm_time_mutex);
+  return frozen;
 }
 
 

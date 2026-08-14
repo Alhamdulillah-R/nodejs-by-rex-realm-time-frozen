@@ -10,6 +10,7 @@
 #include "util-inl.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cctype>
 #include <cerrno>
 #include <cmath>
@@ -54,6 +55,127 @@ constexpr uint64_t kTokenSequenceStride = 1ULL << kTokenGenerationShift;
 // in the Worker as well.
 constexpr size_t kCompletedCallLimit = 512;
 constexpr size_t kMaxControllerResponseBytes = 64 * 1024 * 1024;
+
+struct ProcessClockSnapshot {
+  bool enabled;
+  bool frozen;
+  double wall_time_offset_ms;
+  double monotonic_time_offset_ns;
+  double frozen_wall_time_ms;
+  double frozen_monotonic_time_ns;
+};
+
+// A Realm is a process boundary.  Contexts and Worker isolates still own a
+// controller object for binding resolution, but every target-visible clock
+// reads this one process projection.  The sequence counter makes the hot clock
+// read path lock-free while the single active owner serializes writes.
+struct ProcessClockState {
+  std::atomic<uint64_t> sequence{0};
+  std::atomic<const RealmTimeController*> owner{nullptr};
+  std::atomic<bool> enabled{false};
+  std::atomic<bool> frozen{false};
+  std::atomic<double> wall_time_offset_ms{0};
+  std::atomic<double> monotonic_time_offset_ns{0};
+  std::atomic<double> frozen_wall_time_ms{0};
+  std::atomic<double> frozen_monotonic_time_ns{0};
+};
+
+ProcessClockState process_clock;
+
+void BeginProcessClockWrite() {
+  process_clock.sequence.fetch_add(1, std::memory_order_acq_rel);
+}
+
+void EndProcessClockWrite() {
+  process_clock.sequence.fetch_add(1, std::memory_order_release);
+}
+
+bool EnableProcessClock(const RealmTimeController* owner) {
+  const RealmTimeController* expected = nullptr;
+  if (!process_clock.owner.compare_exchange_strong(
+          expected, owner, std::memory_order_acq_rel)) {
+    return expected == owner;
+  }
+  BeginProcessClockWrite();
+  process_clock.wall_time_offset_ms.store(0, std::memory_order_relaxed);
+  process_clock.monotonic_time_offset_ns.store(0, std::memory_order_relaxed);
+  process_clock.frozen_wall_time_ms.store(0, std::memory_order_relaxed);
+  process_clock.frozen_monotonic_time_ns.store(0, std::memory_order_relaxed);
+  process_clock.frozen.store(false, std::memory_order_relaxed);
+  process_clock.enabled.store(true, std::memory_order_relaxed);
+  EndProcessClockWrite();
+  return true;
+}
+
+void DisableProcessClock(const RealmTimeController* owner) {
+  if (process_clock.owner.load(std::memory_order_acquire) != owner) return;
+  BeginProcessClockWrite();
+  process_clock.enabled.store(false, std::memory_order_relaxed);
+  process_clock.frozen.store(false, std::memory_order_relaxed);
+  process_clock.wall_time_offset_ms.store(0, std::memory_order_relaxed);
+  process_clock.monotonic_time_offset_ns.store(0, std::memory_order_relaxed);
+  process_clock.frozen_wall_time_ms.store(0, std::memory_order_relaxed);
+  process_clock.frozen_monotonic_time_ns.store(0, std::memory_order_relaxed);
+  EndProcessClockWrite();
+  process_clock.owner.store(nullptr, std::memory_order_release);
+}
+
+bool FreezeProcessClock(const RealmTimeController* owner,
+                        double wall_time_ms,
+                        double monotonic_time_ns) {
+  if (process_clock.owner.load(std::memory_order_acquire) != owner ||
+      !process_clock.enabled.load(std::memory_order_acquire)) {
+    return false;
+  }
+  BeginProcessClockWrite();
+  process_clock.frozen_wall_time_ms.store(wall_time_ms,
+                                          std::memory_order_relaxed);
+  process_clock.frozen_monotonic_time_ns.store(monotonic_time_ns,
+                                               std::memory_order_relaxed);
+  process_clock.frozen.store(true, std::memory_order_relaxed);
+  EndProcessClockWrite();
+  return true;
+}
+
+bool ResumeProcessClock(const RealmTimeController* owner,
+                        double wall_time_offset_ms,
+                        double monotonic_time_offset_ns) {
+  if (process_clock.owner.load(std::memory_order_acquire) != owner ||
+      !std::isfinite(wall_time_offset_ms) ||
+      !std::isfinite(monotonic_time_offset_ns)) {
+    return false;
+  }
+  BeginProcessClockWrite();
+  process_clock.wall_time_offset_ms.store(wall_time_offset_ms,
+                                          std::memory_order_relaxed);
+  process_clock.monotonic_time_offset_ns.store(monotonic_time_offset_ns,
+                                               std::memory_order_relaxed);
+  process_clock.frozen.store(false, std::memory_order_relaxed);
+  EndProcessClockWrite();
+  return true;
+}
+
+ProcessClockSnapshot ReadProcessClock() {
+  ProcessClockSnapshot snapshot;
+  uint64_t before;
+  uint64_t after;
+  do {
+    before = process_clock.sequence.load(std::memory_order_acquire);
+    if (before & 1) continue;
+    snapshot.enabled = process_clock.enabled.load(std::memory_order_relaxed);
+    snapshot.frozen = process_clock.frozen.load(std::memory_order_relaxed);
+    snapshot.wall_time_offset_ms =
+        process_clock.wall_time_offset_ms.load(std::memory_order_relaxed);
+    snapshot.monotonic_time_offset_ns =
+        process_clock.monotonic_time_offset_ns.load(std::memory_order_relaxed);
+    snapshot.frozen_wall_time_ms =
+        process_clock.frozen_wall_time_ms.load(std::memory_order_relaxed);
+    snapshot.frozen_monotonic_time_ns =
+        process_clock.frozen_monotonic_time_ns.load(std::memory_order_relaxed);
+    after = process_clock.sequence.load(std::memory_order_acquire);
+  } while (before != after || (after & 1));
+  return snapshot;
+}
 
 #ifdef _WIN32
 using NativeSocket = SOCKET;
@@ -126,7 +248,8 @@ bool DecodeChunkedBody(std::string_view encoded, std::string* decoded) {
 
 bool ParseHttpResponse(std::string_view response,
                        int* status_code,
-                       std::string* body) {
+                       std::string* body,
+                       bool* hard_suspended) {
   size_t header_end = response.find("\r\n\r\n");
   if (header_end == std::string_view::npos) return false;
   std::string_view headers = response.substr(0, header_end);
@@ -175,6 +298,8 @@ bool ParseHttpResponse(std::string_view response,
           return false;
         }
         content_length = static_cast<size_t>(parsed);
+      } else if (name == "x-rex-realm-hard-suspended") {
+        *hard_suspended = value == "1";
       }
     }
     cursor = line_end + 2;
@@ -198,6 +323,7 @@ uint64_t TokenGeneration(uint64_t token) {
 struct ControllerHttpResponse {
   int status_code;
   std::string body;
+  bool hard_suspended = false;
 };
 
 bool PerformControllerPost(Environment* env,
@@ -281,7 +407,10 @@ bool PerformControllerPost(Environment* env,
   }
   CloseNativeSocket(socket_handle);
 
-  if (!ParseHttpResponse(response, &result->status_code, &result->body)) {
+  if (!ParseHttpResponse(response,
+                         &result->status_code,
+                         &result->body,
+                         &result->hard_suspended)) {
     env->ThrowError("Controller returned an invalid HTTP response");
     return false;
   }
@@ -298,10 +427,7 @@ uint64_t RealMonotonicTimeNanoseconds() {
 
 int64_t RealmDateNowCallback(Isolate* isolate, int64_t real_time_millis) {
   HandleScope handle_scope(isolate);
-  RealmTimeController* controller = GetCurrentController(isolate);
-  if (controller == nullptr) return real_time_millis;
-
-  double result = controller->CurrentWallTimeMilliseconds(real_time_millis);
+  double result = CurrentWallTimeMilliseconds(real_time_millis);
   if (!std::isfinite(result) ||
       result < static_cast<double>(std::numeric_limits<int64_t>::min()) ||
       result > static_cast<double>(std::numeric_limits<int64_t>::max())) {
@@ -584,6 +710,11 @@ void RequestExternalCallBinding(const FunctionCallbackInfo<Value>& args) {
                              &response)) {
     return;
   }
+  if (response.hard_suspended &&
+      !ReturnTransactionResult(
+          env, controller->RequireReleaseExternalCall(token))) {
+    return;
+  }
 
   Isolate* isolate = args.GetIsolate();
   Local<Context> context = isolate->GetCurrentContext();
@@ -647,6 +778,14 @@ void ReleaseExternalCallBinding(const FunctionCallbackInfo<Value>& args) {
       message.append(": ").append(response.body.substr(0, 512));
     }
     env->ThrowError(message.c_str());
+    return;
+  }
+  if (!ReturnTransactionResult(
+          env,
+          controller->FinalizeReleaseExternalCall(
+              token,
+              RealWallTimeMilliseconds(env),
+              RealMonotonicTimeNanoseconds()))) {
     return;
   }
   args.GetReturnValue().Set(true);
@@ -725,6 +864,8 @@ void GetStateBinding(const FunctionCallbackInfo<Value>& args) {
   set("generation",
       Number::New(isolate, static_cast<double>(controller->generation())));
   const char* phase = !controller->enabled()  ? "disabled"
+                      : controller->release_pending()
+                          ? "release-pending"
                       : !controller->frozen() ? "running"
                       : controller->parked()  ? "parked"
                                               : "freezing";
@@ -779,8 +920,12 @@ bool RealmTimeController::Enable(double real_wall_time_ms,
                                  uint64_t real_monotonic_time_ns,
                                  uv_loop_t* event_loop) {
   if (event_loop == nullptr) return false;
-  if (enabled_) uv_realm_time_disable(event_loop_, this);
+  if (enabled_) Disable();
   if (uv_realm_time_enable(event_loop, this) != 0) return false;
+  if (!EnableProcessClock(this)) {
+    uv_realm_time_disable(event_loop, this);
+    return false;
+  }
 
   constexpr uint64_t kMaxGeneration =
       (kMaxSafeInteger - 1) / kTokenSequenceStride;
@@ -794,6 +939,8 @@ bool RealmTimeController::Enable(double real_wall_time_ms,
   frozen_monotonic_time_ns_ = real_monotonic_time_ns;
   frames_.clear();
   completed_calls_.clear();
+  pending_release_token_ = kInvalidToken;
+  pending_release_duration_ms_ = 0;
   return true;
 }
 
@@ -801,6 +948,7 @@ void RealmTimeController::Disable() {
   if (enabled_ && event_loop_ != nullptr) {
     uv_realm_time_disable(event_loop_, this);
   }
+  DisableProcessClock(this);
   enabled_ = false;
   event_loop_ = nullptr;
   wall_time_offset_ms_ = 0;
@@ -809,6 +957,8 @@ void RealmTimeController::Disable() {
   frozen_monotonic_time_ns_ = 0;
   frames_.clear();
   completed_calls_.clear();
+  pending_release_token_ = kInvalidToken;
+  pending_release_duration_ms_ = 0;
 }
 
 uint64_t RealmTimeController::NextToken() {
@@ -820,18 +970,35 @@ uint64_t RealmTimeController::BeginExternalCall(double real_wall_time_ms,
                                                 uint64_t real_monotonic_time_ns,
                                                 std::string operation) {
   if (!enabled_) return kInvalidToken;
+  if (pending_release_token_ != kInvalidToken) return kInvalidToken;
   if (frames_.empty()) {
     frozen_wall_time_ms_ = CurrentWallTimeMilliseconds(real_wall_time_ms);
     frozen_monotonic_time_ns_ =
         CurrentMonotonicTimeNanoseconds(real_monotonic_time_ns);
-    if (uv_realm_time_freeze(event_loop_, this) != 0) return kInvalidToken;
+    if (!FreezeProcessClock(
+            this, frozen_wall_time_ms_, frozen_monotonic_time_ns_)) {
+      return kInvalidToken;
+    }
+    if (uv_realm_time_freeze(event_loop_, this) != 0) {
+      ResumeProcessClock(this,
+                         frozen_wall_time_ms_ - real_wall_time_ms,
+                         frozen_monotonic_time_ns_ -
+                             static_cast<double>(real_monotonic_time_ns));
+      return kInvalidToken;
+    }
   }
   uint64_t token = NextToken();
   if (token == kInvalidToken) {
-    if (frames_.empty()) uv_realm_time_resume(event_loop_, this, 0);
+    if (frames_.empty()) {
+      uv_realm_time_resume(event_loop_, this, 0);
+      ResumeProcessClock(this,
+                         frozen_wall_time_ms_ - real_wall_time_ms,
+                         frozen_monotonic_time_ns_ -
+                             static_cast<double>(real_monotonic_time_ns));
+    }
     return kInvalidToken;
   }
-  frames_.push_back({token, std::move(operation), false, 0});
+  frames_.push_back({token, std::move(operation), false, false, 0});
   return token;
 }
 
@@ -845,6 +1012,20 @@ RealmTimeController::TransactionResult RealmTimeController::ParkExternalCall(
   if (frames_.back().token != token) return TransactionResult::kOutOfOrder;
   if (frames_.back().parked) return TransactionResult::kIdempotent;
   frames_.back().parked = true;
+  return TransactionResult::kOk;
+}
+
+RealmTimeController::TransactionResult
+RealmTimeController::RequireReleaseExternalCall(uint64_t token) {
+  if (!enabled_) return TransactionResult::kNotEnabled;
+  if (!TokenHasCurrentGeneration(token)) {
+    return TransactionResult::kStaleGeneration;
+  }
+  if (frames_.empty()) return TransactionResult::kNoActiveCall;
+  if (frames_.back().token != token) return TransactionResult::kOutOfOrder;
+  if (!frames_.back().parked) return TransactionResult::kNotParked;
+  if (frames_.back().release_required) return TransactionResult::kIdempotent;
+  frames_.back().release_required = true;
   return TransactionResult::kOk;
 }
 
@@ -877,6 +1058,7 @@ RealmTimeController::TransactionResult RealmTimeController::CommitExternalCall(
   if (!std::isfinite(committed_duration_ms)) {
     return TransactionResult::kClockOverflow;
   }
+  const bool release_required = frames_.back().release_required;
   if (frames_.size() > 1) {
     double parent_duration = frames_[frames_.size() - 2].committed_duration_ms +
                              committed_duration_ms;
@@ -884,10 +1066,15 @@ RealmTimeController::TransactionResult RealmTimeController::CommitExternalCall(
       return TransactionResult::kClockOverflow;
     }
     frames_[frames_.size() - 2].committed_duration_ms = parent_duration;
-  } else if (!Resume(committed_duration_ms,
-                     real_wall_time_ms,
-                     real_monotonic_time_ns)) {
-    return TransactionResult::kClockOverflow;
+  } else if (release_required) {
+    pending_release_token_ = token;
+    pending_release_duration_ms_ = committed_duration_ms;
+  } else {
+    if (!Resume(committed_duration_ms,
+                real_wall_time_ms,
+                real_monotonic_time_ns)) {
+      return TransactionResult::kClockOverflow;
+    }
   }
 
   frames_.pop_back();
@@ -905,9 +1092,13 @@ RealmTimeController::TransactionResult RealmTimeController::AbortExternalCall(
   if (completed != TransactionResult::kNoActiveCall) return completed;
   if (frames_.empty()) return TransactionResult::kNoActiveCall;
   if (frames_.back().token != token) return TransactionResult::kOutOfOrder;
-  if (frames_.size() == 1 &&
-      !Resume(0, real_wall_time_ms, real_monotonic_time_ns)) {
-    return TransactionResult::kClockOverflow;
+  if (frames_.size() == 1) {
+    if (frames_.back().release_required) {
+      pending_release_token_ = token;
+      pending_release_duration_ms_ = 0;
+    } else if (!Resume(0, real_wall_time_ms, real_monotonic_time_ns)) {
+      return TransactionResult::kClockOverflow;
+    }
   }
   frames_.pop_back();
   RememberCompletion(token, false, 0, 0);
@@ -930,6 +1121,31 @@ RealmTimeController::ValidateReleaseExternalCall(uint64_t token) const {
   return TransactionResult::kNoActiveCall;
 }
 
+RealmTimeController::TransactionResult
+RealmTimeController::FinalizeReleaseExternalCall(
+    uint64_t token,
+    double real_wall_time_ms,
+    uint64_t real_monotonic_time_ns) {
+  if (!enabled_) return TransactionResult::kNotEnabled;
+  if (!TokenHasCurrentGeneration(token)) {
+    return TransactionResult::kStaleGeneration;
+  }
+  if (pending_release_token_ == kInvalidToken) {
+    return ValidateReleaseExternalCall(token) == TransactionResult::kOk
+               ? TransactionResult::kIdempotent
+               : TransactionResult::kNoActiveCall;
+  }
+  if (pending_release_token_ != token) return TransactionResult::kOutOfOrder;
+  if (!Resume(pending_release_duration_ms_,
+              real_wall_time_ms,
+              real_monotonic_time_ns)) {
+    return TransactionResult::kClockOverflow;
+  }
+  pending_release_token_ = kInvalidToken;
+  pending_release_duration_ms_ = 0;
+  return TransactionResult::kOk;
+}
+
 bool RealmTimeController::Resume(double committed_duration_ms,
                                  double real_wall_time_ms,
                                  uint64_t real_monotonic_time_ns) {
@@ -942,6 +1158,10 @@ bool RealmTimeController::Resume(double committed_duration_ms,
   if (!std::isfinite(wall_time_offset_ms) ||
       !std::isfinite(monotonic_time_offset_ns) ||
       uv_realm_time_resume(event_loop_, this, committed_duration_ms) != 0) {
+    return false;
+  }
+  if (!ResumeProcessClock(
+          this, wall_time_offset_ms, monotonic_time_offset_ns)) {
     return false;
   }
   wall_time_offset_ms_ = wall_time_offset_ms;
@@ -984,22 +1204,35 @@ bool RealmTimeController::TokenHasCurrentGeneration(uint64_t token) const {
 
 const std::string& RealmTimeController::active_operation() const {
   static const std::string empty;
-  return frames_.empty() ? empty : frames_.back().operation;
+  static const std::string release = "release";
+  return frames_.empty()
+             ? (pending_release_token_ == kInvalidToken ? empty : release)
+             : frames_.back().operation;
 }
 
 double RealmTimeController::CurrentWallTimeMilliseconds(
     double real_wall_time_ms) const {
-  if (!enabled_) return real_wall_time_ms;
-  if (frozen()) return frozen_wall_time_ms_;
-  return real_wall_time_ms + wall_time_offset_ms_;
+  return realm_time::CurrentWallTimeMilliseconds(real_wall_time_ms);
+}
+
+double CurrentWallTimeMilliseconds(double real_wall_time_ms) {
+  ProcessClockSnapshot snapshot = ReadProcessClock();
+  if (!snapshot.enabled) return real_wall_time_ms;
+  if (snapshot.frozen) return snapshot.frozen_wall_time_ms;
+  return real_wall_time_ms + snapshot.wall_time_offset_ms;
 }
 
 double RealmTimeController::CurrentMonotonicTimeNanoseconds(
     uint64_t real_monotonic_time_ns) const {
-  if (!enabled_) return static_cast<double>(real_monotonic_time_ns);
-  if (frozen()) return frozen_monotonic_time_ns_;
+  return realm_time::CurrentMonotonicTimeNanoseconds(real_monotonic_time_ns);
+}
+
+double CurrentMonotonicTimeNanoseconds(uint64_t real_monotonic_time_ns) {
+  ProcessClockSnapshot snapshot = ReadProcessClock();
+  if (!snapshot.enabled) return static_cast<double>(real_monotonic_time_ns);
+  if (snapshot.frozen) return snapshot.frozen_monotonic_time_ns;
   return static_cast<double>(real_monotonic_time_ns) +
-         monotonic_time_offset_ns_;
+         snapshot.monotonic_time_offset_ns;
 }
 
 RealmTimeController* GetController(Local<Context> context) {
