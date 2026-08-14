@@ -9,6 +9,7 @@ const realmTime = process._realmTime;
 
 assert.strictEqual(typeof realmTime, 'object');
 assert(Object.isFrozen(realmTime));
+assert.strictEqual(typeof realmTime.releaseExternalCall, 'function');
 
 function blockHost(delay) {
   Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, delay);
@@ -65,23 +66,47 @@ function onceLine(stream) {
   // Worker event-loop callback is needed to deliver the response.
   const controller = spawn(process.execPath, ['-e', `
     const http = require('http');
+    let queryHeaders;
+    let releaseCount = 0;
     const server = http.createServer((request, response) => {
       let body = '';
       request.setEncoding('utf8');
       request.on('data', (chunk) => body += chunk);
-      request.on('end', () => setTimeout(() => {
-        response.end(JSON.stringify({
-          parkAck: request.headers['x-rex-realm-park-ack'],
-          token: request.headers['x-rex-realm-token'],
-          generation: request.headers['x-rex-realm-generation'],
-          workerPid: request.headers['x-rex-realm-worker-pid'],
-          controlTid: request.headers['x-rex-realm-control-tid'],
-          request: JSON.parse(body),
-          functionDurationMs: 4,
-          timelineAdjustmentMs: 1,
-        }));
-        server.close();
-      }, 40));
+      request.on('end', () => {
+        if (request.url === '/api/query') {
+          queryHeaders = request.headers;
+          setTimeout(() => response.end(JSON.stringify({
+            parkAck: request.headers['x-rex-realm-park-ack'],
+            token: request.headers['x-rex-realm-token'],
+            generation: request.headers['x-rex-realm-generation'],
+            workerPid: request.headers['x-rex-realm-worker-pid'],
+            controlTid: request.headers['x-rex-realm-control-tid'],
+            request: JSON.parse(body),
+            functionDurationMs: 4,
+            timelineAdjustmentMs: 1,
+          })), 40);
+          return;
+        }
+
+        const token = request.headers['x-rex-realm-token'];
+        const expectedGeneration = token === undefined ? '' :
+          String(BigInt(token) >> 24n);
+        const controlTid = request.headers['x-rex-realm-control-tid'];
+        const valid = request.method === 'POST' &&
+          request.headers['x-rex-realm-release'] === '1' &&
+          request.headers['x-rex-realm-park-ack'] === '1' &&
+          request.headers['x-rex-realm-generation'] === expectedGeneration &&
+          request.headers['x-rex-realm-worker-pid'] ===
+            queryHeaders['x-rex-realm-worker-pid'] &&
+          body === '{}' &&
+          (process.platform !== 'win32' ||
+            (Number(controlTid) > 0 &&
+             controlTid === queryHeaders['x-rex-realm-control-tid']));
+        response.statusCode = valid ?
+          (request.url === '/api/realm-release-fail' ? 409 : 204) : 422;
+        response.end();
+        if (++releaseCount === 3) server.close();
+      });
     });
     server.listen(0, '127.0.0.1', () => {
       console.log(server.address().port);
@@ -114,6 +139,25 @@ function onceLine(stream) {
     envelope.functionDurationMs,
     envelope.timelineAdjustmentMs);
   assert(performance.now() - requestFrozen >= 5);
+  assert.strictEqual(
+    realmTime.releaseExternalCall(null, requestToken, controllerPort), true);
+
+  // Release is a second-phase Controller acknowledgement. It remains valid
+  // after either terminal outcome and derives generation from the token.
+  const abortedRequestToken = realmTime.beginExternalCall(
+    null, 'cdp.query.abort');
+  realmTime.abortExternalCall(null, abortedRequestToken);
+  assert.strictEqual(
+    realmTime.releaseExternalCall(null, abortedRequestToken, controllerPort),
+    true);
+  assert.throws(
+    () => realmTime.releaseExternalCall(
+      null,
+      abortedRequestToken,
+      controllerPort,
+      '/api/realm-release-fail'),
+    /HTTP status 409/);
+  await new Promise((resolve) => controller.once('exit', resolve));
 
   // libuv timer deadlines use the logical loop clock. A real 60 ms park with
   // a zero-duration commit must not make a pending timer immediately expire.

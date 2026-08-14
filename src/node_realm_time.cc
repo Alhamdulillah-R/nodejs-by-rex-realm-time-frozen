@@ -47,7 +47,8 @@ namespace {
 
 constexpr double kNanosecondsPerMillisecond = 1e6;
 constexpr uint64_t kMaxSafeInteger = 9007199254740991ULL;
-constexpr uint64_t kTokenSequenceStride = 1ULL << 24;
+constexpr uint64_t kTokenGenerationShift = 24;
+constexpr uint64_t kTokenSequenceStride = 1ULL << kTokenGenerationShift;
 constexpr size_t kCompletedCallLimit = 256;
 constexpr size_t kMaxControllerResponseBytes = 64 * 1024 * 1024;
 
@@ -187,6 +188,103 @@ bool ParseHttpResponse(std::string_view response,
   return true;
 }
 
+uint64_t TokenGeneration(uint64_t token) {
+  return token >> kTokenGenerationShift;
+}
+
+struct ControllerHttpResponse {
+  int status_code;
+  std::string body;
+};
+
+bool PerformControllerPost(Environment* env,
+                           uint32_t port,
+                           std::string_view path,
+                           std::string_view body,
+                           uint64_t token,
+                           uint64_t generation,
+                           bool release,
+                           ControllerHttpResponse* result) {
+  NativeSocket socket_handle = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+  if (socket_handle == kInvalidSocket) {
+    env->ThrowError("failed to create Controller socket");
+    return false;
+  }
+
+  sockaddr_in address{};
+  address.sin_family = AF_INET;
+  address.sin_port = htons(static_cast<uint16_t>(port));
+  address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+  if (connect(socket_handle,
+              reinterpret_cast<const sockaddr*>(&address),
+              sizeof(address)) != 0) {
+    CloseNativeSocket(socket_handle);
+    env->ThrowError("failed to connect to the loopback Controller");
+    return false;
+  }
+
+  std::string request;
+  request.reserve(body.size() + path.size() + 320);
+  request.append("POST ").append(path).append(" HTTP/1.1\r\n");
+  request.append("Host: 127.0.0.1:")
+      .append(std::to_string(port))
+      .append("\r\n");
+  request.append("Content-Type: application/json\r\n");
+  request.append("Connection: close\r\n");
+  request.append("X-Rex-Realm-Park-Ack: 1\r\n");
+  request.append("X-Rex-Realm-Token: ")
+      .append(std::to_string(token))
+      .append("\r\n");
+  request.append("X-Rex-Realm-Generation: ")
+      .append(std::to_string(generation))
+      .append("\r\n");
+  request.append("X-Rex-Realm-Worker-Pid: ")
+      .append(std::to_string(uv_os_getpid()))
+      .append("\r\n");
+#ifdef _WIN32
+  request.append("X-Rex-Realm-Control-Tid: ")
+      .append(std::to_string(GetCurrentThreadId()))
+      .append("\r\n");
+#endif
+  if (release) request.append("X-Rex-Realm-Release: 1\r\n");
+  request.append("Content-Length: ")
+      .append(std::to_string(body.size()))
+      .append("\r\n\r\n")
+      .append(body);
+
+  if (!SendAll(socket_handle, request)) {
+    CloseNativeSocket(socket_handle);
+    env->ThrowError(release ? "failed to send the Controller release request"
+                            : "failed to send the parked Controller request");
+    return false;
+  }
+
+  std::string response;
+  char buffer[16 * 1024];
+  while (true) {
+    int received = recv(socket_handle, buffer, sizeof(buffer), 0);
+    if (received == 0) break;
+    if (received < 0) {
+      CloseNativeSocket(socket_handle);
+      env->ThrowError("failed to receive the Controller response");
+      return false;
+    }
+    if (response.size() > kMaxControllerResponseBytes + 64 * 1024 - received) {
+      CloseNativeSocket(socket_handle);
+      env->ThrowRangeError("Controller response exceeds the 64 MiB limit");
+      return false;
+    }
+    response.append(buffer, static_cast<size_t>(received));
+  }
+  CloseNativeSocket(socket_handle);
+
+  if (!ParseHttpResponse(response, &result->status_code, &result->body)) {
+    env->ThrowError("Controller returned an invalid HTTP response");
+    return false;
+  }
+  return true;
+}
+
 double RealWallTimeMilliseconds(Environment* env) {
   return std::floor(env->isolate_data()->platform()->CurrentClockTimeMillis());
 }
@@ -248,6 +346,41 @@ bool ReadToken(Environment* env, Local<Value> value, uint64_t* result) {
     return false;
   }
   *result = static_cast<uint64_t>(token);
+  return true;
+}
+
+bool ReadControllerPort(Environment* env,
+                        Local<Value> value,
+                        uint32_t* result) {
+  if (!value->IsUint32()) {
+    env->ThrowTypeError("port must be an unsigned integer");
+    return false;
+  }
+  uint32_t port = value.As<Integer>()->Value();
+  if (port == 0 || port > 65535) {
+    env->ThrowRangeError("port must be between 1 and 65535");
+    return false;
+  }
+  *result = port;
+  return true;
+}
+
+bool ReadControllerPath(Environment* env,
+                        Local<Value> value,
+                        std::string* result) {
+  if (!value->IsString()) {
+    env->ThrowTypeError("path must be a string");
+    return false;
+  }
+  Utf8Value path_value(env->isolate(), value);
+  if (*path_value == nullptr || path_value.length() == 0 ||
+      (*path_value)[0] != '/' ||
+      std::string_view(*path_value, path_value.length())
+              .find_first_of("\r\n") != std::string_view::npos) {
+    env->ThrowRangeError("path must be an absolute HTTP path without newlines");
+    return false;
+  }
+  result->assign(*path_value, path_value.length());
   return true;
 }
 
@@ -414,114 +547,34 @@ void RequestExternalCallBinding(const FunctionCallbackInfo<Value>& args) {
 
   uint64_t token;
   if (!ReadToken(env, args[1], &token)) return;
-  if (!args[2]->IsUint32()) {
-    env->ThrowTypeError("port must be an unsigned integer");
+  uint32_t port;
+  if (!ReadControllerPort(env, args[2], &port)) return;
+  std::string path;
+  if (!ReadControllerPath(env, args[3], &path)) return;
+  if (!args[4]->IsString()) {
+    env->ThrowTypeError("body must be a string");
     return;
   }
-  uint32_t port = args[2].As<Integer>()->Value();
-  if (port == 0 || port > 65535) {
-    env->ThrowRangeError("port must be between 1 and 65535");
-    return;
-  }
-  if (!args[3]->IsString() || !args[4]->IsString()) {
-    env->ThrowTypeError("path and body must be strings");
-    return;
-  }
-  Utf8Value path_value(env->isolate(), args[3]);
   Utf8Value body_value(env->isolate(), args[4]);
-  if (*path_value == nullptr || path_value.length() == 0 ||
-      (*path_value)[0] != '/' ||
-      std::string_view(*path_value, path_value.length())
-              .find_first_of("\r\n") != std::string_view::npos) {
-    env->ThrowRangeError("path must be an absolute HTTP path without newlines");
-    return;
-  }
   if (*body_value == nullptr) {
     env->ThrowError("failed to encode request body as UTF-8");
     return;
   }
-  std::string path(*path_value, path_value.length());
   std::string body(*body_value, body_value.length());
 
   if (!ReturnTransactionResult(env, controller->ParkExternalCall(token))) {
     return;
   }
 
-  NativeSocket socket_handle = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
-  if (socket_handle == kInvalidSocket) {
-    env->ThrowError("failed to create Controller socket");
-    return;
-  }
-
-  sockaddr_in address{};
-  address.sin_family = AF_INET;
-  address.sin_port = htons(static_cast<uint16_t>(port));
-  address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-  if (connect(socket_handle,
-              reinterpret_cast<const sockaddr*>(&address),
-              sizeof(address)) != 0) {
-    CloseNativeSocket(socket_handle);
-    env->ThrowError("failed to connect to the loopback Controller");
-    return;
-  }
-
-  std::string request;
-  request.reserve(body.size() + path.size() + 256);
-  request.append("POST ").append(path).append(" HTTP/1.1\r\n");
-  request.append("Host: 127.0.0.1:")
-      .append(std::to_string(port))
-      .append("\r\n");
-  request.append("Content-Type: application/json\r\n");
-  request.append("Connection: close\r\n");
-  request.append("X-Rex-Realm-Park-Ack: 1\r\n");
-  request.append("X-Rex-Realm-Token: ")
-      .append(std::to_string(token))
-      .append("\r\n");
-  request.append("X-Rex-Realm-Generation: ")
-      .append(std::to_string(controller->generation()))
-      .append("\r\n");
-  request.append("X-Rex-Realm-Worker-Pid: ")
-      .append(std::to_string(uv_os_getpid()))
-      .append("\r\n");
-#ifdef _WIN32
-  request.append("X-Rex-Realm-Control-Tid: ")
-      .append(std::to_string(GetCurrentThreadId()))
-      .append("\r\n");
-#endif
-  request.append("Content-Length: ")
-      .append(std::to_string(body.size()))
-      .append("\r\n\r\n")
-      .append(body);
-
-  if (!SendAll(socket_handle, request)) {
-    CloseNativeSocket(socket_handle);
-    env->ThrowError("failed to send the parked Controller request");
-    return;
-  }
-
-  std::string response;
-  char buffer[16 * 1024];
-  while (true) {
-    int received = recv(socket_handle, buffer, sizeof(buffer), 0);
-    if (received == 0) break;
-    if (received < 0) {
-      CloseNativeSocket(socket_handle);
-      env->ThrowError("failed to receive the Controller response");
-      return;
-    }
-    if (response.size() > kMaxControllerResponseBytes + 64 * 1024 - received) {
-      CloseNativeSocket(socket_handle);
-      env->ThrowRangeError("Controller response exceeds the 64 MiB limit");
-      return;
-    }
-    response.append(buffer, static_cast<size_t>(received));
-  }
-  CloseNativeSocket(socket_handle);
-
-  int status_code;
-  std::string response_body;
-  if (!ParseHttpResponse(response, &status_code, &response_body)) {
-    env->ThrowError("Controller returned an invalid HTTP response");
+  ControllerHttpResponse response;
+  if (!PerformControllerPost(env,
+                             port,
+                             path,
+                             body,
+                             token,
+                             TokenGeneration(token),
+                             false,
+                             &response)) {
     return;
   }
 
@@ -531,19 +584,61 @@ void RequestExternalCallBinding(const FunctionCallbackInfo<Value>& args) {
   result
       ->Set(context,
             OneByteString(isolate, "statusCode"),
-            Integer::New(isolate, status_code))
+            Integer::New(isolate, response.status_code))
       .Check();
   Local<String> response_body_value;
   if (!String::NewFromUtf8(isolate,
-                           response_body.data(),
+                           response.body.data(),
                            v8::NewStringType::kNormal,
-                           static_cast<int>(response_body.size()))
+                           static_cast<int>(response.body.size()))
            .ToLocal(&response_body_value)) {
     return;
   }
   result->Set(context, OneByteString(isolate, "body"), response_body_value)
       .Check();
   args.GetReturnValue().Set(result);
+}
+
+void ReleaseExternalCallBinding(const FunctionCallbackInfo<Value>& args) {
+  Environment* env = Environment::GetCurrent(args);
+  RealmTimeController* controller = ResolveController(args);
+  if (controller == nullptr) return;
+  if (args.Length() < 3) {
+    env->ThrowTypeError(
+        "releaseExternalCall requires context, token, and port");
+    return;
+  }
+
+  uint64_t token;
+  if (!ReadToken(env, args[1], &token)) return;
+  const uint64_t generation = TokenGeneration(token);
+  if (generation != controller->generation()) {
+    env->ThrowError("external call token belongs to a stale generation");
+    return;
+  }
+  uint32_t port;
+  if (!ReadControllerPort(env, args[2], &port)) return;
+
+  std::string path = "/api/realm-release";
+  if (args.Length() >= 4 && !args[3]->IsUndefined()) {
+    if (!ReadControllerPath(env, args[3], &path)) return;
+  }
+
+  ControllerHttpResponse response;
+  if (!PerformControllerPost(
+          env, port, path, "{}", token, generation, true, &response)) {
+    return;
+  }
+  if (response.status_code < 200 || response.status_code >= 300) {
+    std::string message = "Controller release returned HTTP status " +
+                          std::to_string(response.status_code);
+    if (!response.body.empty()) {
+      message.append(": ").append(response.body.substr(0, 512));
+    }
+    env->ThrowError(message.c_str());
+    return;
+  }
+  args.GetReturnValue().Set(true);
 }
 
 void CommitExternalCallBinding(const FunctionCallbackInfo<Value>& args) {
@@ -661,6 +756,7 @@ void Initialize(Local<Object> target,
   SetMethod(context, target, "beginExternalCall", BeginExternalCallBinding);
   SetMethod(context, target, "parkExternalCall", ParkExternalCallBinding);
   SetMethod(context, target, "requestExternalCall", RequestExternalCallBinding);
+  SetMethod(context, target, "releaseExternalCall", ReleaseExternalCallBinding);
   SetMethod(context, target, "commitExternalCall", CommitExternalCallBinding);
   SetMethod(context, target, "abortExternalCall", AbortExternalCallBinding);
   SetMethod(context, target, "getState", GetStateBinding);
@@ -921,6 +1017,7 @@ void RegisterExternalReferences(ExternalReferenceRegistry* registry) {
   registry->Register(BeginExternalCallBinding);
   registry->Register(ParkExternalCallBinding);
   registry->Register(RequestExternalCallBinding);
+  registry->Register(ReleaseExternalCallBinding);
   registry->Register(CommitExternalCallBinding);
   registry->Register(AbortExternalCallBinding);
   registry->Register(GetStateBinding);

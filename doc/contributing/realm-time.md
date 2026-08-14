@@ -49,18 +49,24 @@ const context = null;
 clock.enable(context);
 const token = clock.beginExternalCall(context, 'Runtime.callFunctionOn');
 
+let response;
 try {
   // This native loopback request parks the frame before doing blocking I/O.
   // No callback or promise on the main JS event loop is needed for the reply.
-  const response = clock.requestExternalCall(
+  response = clock.requestExternalCall(
     context,
     token,
     9334,
     '/api/query',
     JSON.stringify(request),
   );
-  const envelope = JSON.parse(response.body);
+} catch (transportError) {
+  clock.abortExternalCall(context, token);
+  throw transportError;
+}
 
+try {
+  const envelope = JSON.parse(response.body);
   clock.commitExternalCall(
     context,
     token,
@@ -71,6 +77,10 @@ try {
 } catch (error) {
   clock.abortExternalCall(context, token);
   throw error;
+} finally {
+  // The Controller keeps non-control Worker threads suspended until this
+  // second-phase acknowledgement proves that JS installed the completion.
+  clock.releaseExternalCall(context, token, 9334);
 }
 ```
 
@@ -86,6 +96,10 @@ Available operations:
   acknowledgement for an offline or otherwise precomputed operation;
 * `requestExternalCall(context, token, port, path, body)` parks the active frame
   and performs a synchronous HTTP request to `127.0.0.1` on a native socket;
+* `releaseExternalCall(context, token, port,
+  path = '/api/realm-release')` performs the second-phase synchronous loopback
+  acknowledgement after commit or abort; it neither parks nor changes time and
+  requires a 2xx Controller response;
 * `commitExternalCall(context, token, functionDurationMs,
   timelineAdjustmentMs = 0)` commits the authoritative logical duration;
 * `abortExternalCall(context, token)` completes a frame without advancing it;
@@ -101,12 +115,22 @@ the response to 64 MiB, and sends these control headers:
 * `X-Rex-Realm-Worker-Pid`
 * `X-Rex-Realm-Control-Tid` (Windows)
 
+`releaseExternalCall` repeats the token, its encoded generation, Worker PID,
+Windows current thread ID, and PARK_ACK headers, and additionally sends:
+
+* `X-Rex-Realm-Release: 1`
+
+Its request body is the empty JSON object `{}`. Generation is decoded from the
+token rather than sampled from mutable controller state.
+
 Only the loopback host is reachable through this binding. The Worker main V8
 thread remains blocked in native connect/send/receive until the response is in
 memory. On Windows its thread ID lets the Controller suspend every other Worker
 thread while leaving only this non-JavaScript socket-drain path runnable; the
-Controller resumes those threads before closing the response. JavaScript then
-parses the envelope and commits before returning the result to sandbox code.
+Controller returns the completion without releasing those threads. JavaScript
+parses the envelope, commits or aborts, and then synchronously sends the release
+acknowledgement. Only after that 2xx release may the Controller resume the
+remaining Worker threads, removing the old Resume-before-JS-commit race.
 
 ## Duration contract
 
