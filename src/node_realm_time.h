@@ -32,6 +32,7 @@ class RealmTimeController final {
     kInvalidDuration,
     kClockOverflow,
     kNotParked,
+    kNotCompleted,
   };
 
   bool Enable(double real_wall_time_ms,
@@ -49,8 +50,9 @@ class RealmTimeController final {
                                        double real_wall_time_ms,
                                        uint64_t real_monotonic_time_ns);
   TransactionResult AbortExternalCall(uint64_t token,
-                                      double real_wall_time_ms,
-                                      uint64_t real_monotonic_time_ns);
+                                       double real_wall_time_ms,
+                                       uint64_t real_monotonic_time_ns);
+  TransactionResult ValidateReleaseExternalCall(uint64_t token) const;
 
   double CurrentWallTimeMilliseconds(double real_wall_time_ms) const;
   double CurrentMonotonicTimeNanoseconds(uint64_t real_monotonic_time_ns) const;

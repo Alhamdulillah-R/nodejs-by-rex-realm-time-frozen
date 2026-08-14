@@ -113,6 +113,19 @@ function onceLine(stream) {
     });
   `], { stdio: ['ignore', 'pipe', 'inherit'] });
   const controllerPort = Number(await onceLine(controller.stdout));
+
+  // The native API itself enforces the two-phase boundary. A caller cannot
+  // resume Controller-suspended threads before the clock reaches a terminal
+  // commit/abort state, even if framework JS is accidentally reordered.
+  const prematureReleaseToken = realmTime.beginExternalCall(
+    null, 'cdp.query.premature-release');
+  realmTime.parkExternalCall(null, prematureReleaseToken);
+  assert.throws(
+    () => realmTime.releaseExternalCall(
+      null, prematureReleaseToken, controllerPort),
+    /committed or aborted before release/);
+  realmTime.abortExternalCall(null, prematureReleaseToken);
+
   const requestToken = realmTime.beginExternalCall(null, 'cdp.query');
   const requestFrozen = performance.now();
   const nativeResponse = realmTime.requestExternalCall(

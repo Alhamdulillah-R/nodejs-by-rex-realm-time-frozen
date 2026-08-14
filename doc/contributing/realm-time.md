@@ -99,7 +99,7 @@ Available operations:
 * `releaseExternalCall(context, token, port,
   path = '/api/realm-release')` performs the second-phase synchronous loopback
   acknowledgement after commit or abort; it neither parks nor changes time and
-  requires a 2xx Controller response;
+  requires a terminal native completion and a 2xx Controller response;
 * `commitExternalCall(context, token, functionDurationMs,
   timelineAdjustmentMs = 0)` commits the authoritative logical duration;
 * `abortExternalCall(context, token)` completes a frame without advancing it;

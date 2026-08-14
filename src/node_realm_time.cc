@@ -49,7 +49,10 @@ constexpr double kNanosecondsPerMillisecond = 1e6;
 constexpr uint64_t kMaxSafeInteger = 9007199254740991ULL;
 constexpr uint64_t kTokenGenerationShift = 24;
 constexpr uint64_t kTokenSequenceStride = 1ULL << kTokenGenerationShift;
-constexpr size_t kCompletedCallLimit = 256;
+// Keep native completion replay aligned with the Controller terminal cache.
+// A token that Go can still replay must remain commit/abort/release-idempotent
+// in the Worker as well.
+constexpr size_t kCompletedCallLimit = 512;
 constexpr size_t kMaxControllerResponseBytes = 64 * 1024 * 1024;
 
 #ifdef _WIN32
@@ -467,6 +470,10 @@ bool ReturnTransactionResult(Environment* env,
       env->ThrowError(
           "external call must be parked before it can be committed");
       break;
+    case Result::kNotCompleted:
+      env->ThrowError(
+          "external call must be committed or aborted before release");
+      break;
   }
   return false;
 }
@@ -614,6 +621,10 @@ void ReleaseExternalCallBinding(const FunctionCallbackInfo<Value>& args) {
   const uint64_t generation = TokenGeneration(token);
   if (generation != controller->generation()) {
     env->ThrowError("external call token belongs to a stale generation");
+    return;
+  }
+  if (!ReturnTransactionResult(
+          env, controller->ValidateReleaseExternalCall(token))) {
     return;
   }
   uint32_t port;
@@ -901,6 +912,22 @@ RealmTimeController::TransactionResult RealmTimeController::AbortExternalCall(
   frames_.pop_back();
   RememberCompletion(token, false, 0, 0);
   return TransactionResult::kOk;
+}
+
+RealmTimeController::TransactionResult
+RealmTimeController::ValidateReleaseExternalCall(uint64_t token) const {
+  if (!enabled_) return TransactionResult::kNotEnabled;
+  if (!TokenHasCurrentGeneration(token)) {
+    return TransactionResult::kStaleGeneration;
+  }
+  for (auto it = completed_calls_.rbegin(); it != completed_calls_.rend();
+       ++it) {
+    if (it->token == token) return TransactionResult::kOk;
+  }
+  for (auto it = frames_.rbegin(); it != frames_.rend(); ++it) {
+    if (it->token == token) return TransactionResult::kNotCompleted;
+  }
+  return TransactionResult::kNoActiveCall;
 }
 
 bool RealmTimeController::Resume(double committed_duration_ms,
