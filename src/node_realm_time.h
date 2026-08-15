@@ -14,6 +14,7 @@
 namespace node {
 
 class ExternalReferenceRegistry;
+class Environment;
 
 namespace realm_time {
 
@@ -126,6 +127,28 @@ class RealmTimeController final {
 
 RealmTimeController* GetController(v8::Local<v8::Context> context);
 RealmTimeController* GetCurrentController(v8::Isolate* isolate);
+
+// Native diagnostics hooks used by the V8 string-code-generation path,
+// node:vm compilation entry points and the global uncaught-exception path.
+// They are opt-in and preserve stock Node behavior when no callback has been
+// registered through process._realmTime.
+v8::ModifyCodeGenerationFromStringsResult ModifyCodeGenerationFromStrings(
+    Environment* env,
+    v8::Local<v8::Context> context,
+    v8::Local<v8::Value> source,
+    bool is_code_like,
+    bool codegen_allowed);
+bool ApplyCodeGenerationCallback(Environment* env,
+                                 v8::Local<v8::Context> context,
+                                 const char* kind,
+                                 v8::Local<v8::String> source,
+                                 v8::Local<v8::Array> parameters,
+                                 v8::Local<v8::Value> resource_name,
+                                 v8::Local<v8::String>* result);
+v8::Local<v8::Value> InterceptUncaughtException(Environment* env,
+                                                v8::Local<v8::Value> exception,
+                                                v8::Local<v8::Message> message,
+                                                bool from_promise);
 
 // Process-wide target clock accessors.  These deliberately do not require a
 // current vm.Context so Worker bootstrap/native callbacks share the Realm

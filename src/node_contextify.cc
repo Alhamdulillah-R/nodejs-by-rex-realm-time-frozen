@@ -31,6 +31,7 @@
 #include "node_external_reference.h"
 #include "node_internals.h"
 #include "node_process.h"
+#include "node_realm_time.h"
 #include "node_sea.h"
 #include "node_snapshot_builder.h"
 #include "node_url.h"
@@ -1014,6 +1015,21 @@ void ContextifyScript::New(const FunctionCallbackInfo<Value>& args) {
     id_symbol = args[7].As<Symbol>();
   }
 
+  Local<String> modified_code;
+  if (!realm_time::ApplyCodeGenerationCallback(env,
+                                               parsing_context,
+                                               "vm.Script",
+                                               code,
+                                               v8::Array::New(isolate),
+                                               filename,
+                                               &modified_code)) {
+    return;
+  }
+  if (modified_code != code) {
+    code = modified_code;
+    cached_data_buf = Local<ArrayBufferView>();
+  }
+
   ContextifyScript* contextify_script = New(env, args.This());
 
   if (*TRACE_EVENT_API_GET_CATEGORY_GROUP_ENABLED(
@@ -1429,6 +1445,23 @@ void ContextifyFunction::CompileFunction(
   if (!args[8]->IsUndefined()) {
     CHECK(args[8]->IsArray());
     params_buf = args[8].As<Array>();
+  }
+
+  Local<String> modified_code;
+  Local<Array> callback_parameters =
+      params_buf.IsEmpty() ? Array::New(isolate) : params_buf;
+  if (!realm_time::ApplyCodeGenerationCallback(env,
+                                               parsing_context,
+                                               "vm.compileFunction",
+                                               code,
+                                               callback_parameters,
+                                               filename,
+                                               &modified_code)) {
+    return;
+  }
+  if (modified_code != code) {
+    code = modified_code;
+    cached_data_buf = Local<ArrayBufferView>();
   }
 
   // Argument 10: host-defined option symbol

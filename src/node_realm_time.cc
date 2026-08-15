@@ -1,6 +1,7 @@
 #include "node_realm_time.h"
 
 #include "env-inl.h"
+#include "ncrypto.h"
 #include "node_binding.h"
 #include "node_context_data.h"
 #include "node_contextify.h"
@@ -15,8 +16,14 @@
 #include <cerrno>
 #include <cmath>
 #include <cstdlib>
+#include <deque>
+#include <iomanip>
 #include <limits>
+#include <memory>
+#include <mutex>
+#include <sstream>
 #include <string_view>
+#include <unordered_map>
 
 #ifdef _WIN32
 #include <winsock2.h>
@@ -33,15 +40,24 @@ namespace node::realm_time {
 
 using v8::Boolean;
 using v8::Context;
+using v8::EscapableHandleScope;
+using v8::Exception;
+using v8::Function;
 using v8::FunctionCallbackInfo;
+using v8::Global;
 using v8::HandleScope;
 using v8::Integer;
 using v8::Isolate;
 using v8::Local;
+using v8::MaybeLocal;
+using v8::Message;
 using v8::Null;
 using v8::Number;
 using v8::Object;
+using v8::StackFrame;
+using v8::StackTrace;
 using v8::String;
+using v8::Undefined;
 using v8::Value;
 
 namespace {
@@ -55,6 +71,488 @@ constexpr uint64_t kTokenSequenceStride = 1ULL << kTokenGenerationShift;
 // in the Worker as well.
 constexpr size_t kCompletedCallLimit = 512;
 constexpr size_t kMaxControllerResponseBytes = 64 * 1024 * 1024;
+constexpr size_t kDiagnosticsRecordLimit = 512;
+
+struct CodeGenerationRecord {
+  uint64_t id;
+  std::string kind;
+  std::string source_hash;
+  std::string root_source_id;
+  int context_id;
+  int parent_script_id;
+  int caller_line;
+  int caller_column;
+  uint64_t worker_id;
+  uint64_t host_monotonic_ns;
+  size_t source_length;
+  bool replaced = false;
+  bool callback_error = false;
+};
+
+struct ExceptionRecord {
+  uint64_t id;
+  std::string origin;
+  std::string root_source_id;
+  int context_id;
+  int script_id;
+  int line;
+  int column;
+  uint64_t worker_id;
+  uint64_t host_monotonic_ns;
+  bool replaced = false;
+  bool callback_error = false;
+};
+
+struct DiagnosticsState {
+  Global<Function> code_generation_callback;
+  Global<Context> code_generation_context;
+  Global<Context> code_generation_target_context;
+  Global<Function> exception_callback;
+  Global<Context> exception_context;
+  Global<Context> exception_target_context;
+  uint64_t code_generation_callback_generation = 0;
+  uint64_t exception_callback_generation = 0;
+  uint64_t next_codegen_id = 0;
+  uint64_t next_exception_id = 0;
+  bool in_codegen_callback = false;
+  bool in_exception_callback = false;
+  bool include_vm_compile = true;
+  bool include_confirmed_unhandled_rejection = true;
+  std::string root_source_id = "target-entry";
+  std::deque<CodeGenerationRecord> code_generation_records;
+  std::deque<ExceptionRecord> exception_records;
+};
+
+std::mutex diagnostics_mutex;
+std::unordered_map<Environment*, std::unique_ptr<DiagnosticsState>>
+    diagnostics_states;
+
+void CleanupDiagnosticsState(void* data) {
+  auto* env = static_cast<Environment*>(data);
+  std::lock_guard<std::mutex> lock(diagnostics_mutex);
+  diagnostics_states.erase(env);
+}
+
+DiagnosticsState* GetDiagnosticsState(Environment* env, bool create) {
+  std::lock_guard<std::mutex> lock(diagnostics_mutex);
+  auto found = diagnostics_states.find(env);
+  if (found != diagnostics_states.end()) return found->second.get();
+  if (!create) return nullptr;
+  auto state = std::make_unique<DiagnosticsState>();
+  DiagnosticsState* result = state.get();
+  diagnostics_states.emplace(env, std::move(state));
+  env->AddCleanupHook(CleanupDiagnosticsState, env);
+  return result;
+}
+
+uint64_t NextSafeSequence(uint64_t* sequence) {
+  *sequence = *sequence >= kMaxSafeInteger ? 1 : *sequence + 1;
+  return *sequence;
+}
+
+Local<String> DiagnosticString(Isolate* isolate, std::string_view value) {
+  return String::NewFromUtf8(isolate,
+                             value.data(),
+                             v8::NewStringType::kNormal,
+                             static_cast<int>(value.size()))
+      .ToLocalChecked();
+}
+
+void SetDiagnosticProperty(Local<Context> context,
+                           Local<Object> target,
+                           const char* name,
+                           Local<Value> value) {
+  target->Set(context, OneByteString(Isolate::GetCurrent(), name), value)
+      .Check();
+}
+
+std::string Sha256(Local<String> source) {
+  Isolate* isolate = Isolate::GetCurrent();
+  Utf8Value utf8(isolate, source);
+  if (*utf8 == nullptr) return {};
+  ncrypto::Buffer<const unsigned char> input = {
+      .data = reinterpret_cast<const unsigned char*>(*utf8),
+      .len = static_cast<size_t>(utf8.length()),
+  };
+  ncrypto::DataPointer digest =
+      ncrypto::hashDigest(input, ncrypto::Digest::SHA256);
+  if (!digest) return {};
+  std::ostringstream hex;
+  hex << std::hex << std::setfill('0');
+  const auto* bytes = digest.get<unsigned char>();
+  for (size_t index = 0; index < digest.size(); index++) {
+    hex << std::setw(2) << static_cast<unsigned int>(bytes[index]);
+  }
+  return hex.str();
+}
+
+std::string ClassifyStringCodeGeneration(Local<String> source) {
+  Isolate* isolate = Isolate::GetCurrent();
+  Utf8Value text(isolate, source);
+  if (*text == nullptr) return "eval";
+  std::string_view view(*text, static_cast<size_t>(text.length()));
+  if (view.starts_with("(function anonymous(")) return "Function";
+  if (view.starts_with("(async function anonymous(")) return "AsyncFunction";
+  if (view.starts_with("(function* anonymous(")) return "GeneratorFunction";
+  if (view.starts_with("(async function* anonymous(")) {
+    return "AsyncGeneratorFunction";
+  }
+  return "eval";
+}
+
+std::string ExtractSourceURL(Local<String> source) {
+  Isolate* isolate = Isolate::GetCurrent();
+  Utf8Value text(isolate, source);
+  if (*text == nullptr) return {};
+  std::string_view view(*text, static_cast<size_t>(text.length()));
+  constexpr std::string_view kHashMarker = "//# sourceURL=";
+  constexpr std::string_view kAtMarker = "//@ sourceURL=";
+  const size_t hash_position = view.rfind(kHashMarker);
+  const size_t at_position = view.rfind(kAtMarker);
+  size_t position;
+  size_t marker_size;
+  if (hash_position == std::string_view::npos &&
+      at_position == std::string_view::npos) {
+    return {};
+  }
+  if (at_position == std::string_view::npos ||
+      (hash_position != std::string_view::npos &&
+       hash_position > at_position)) {
+    position = hash_position;
+    marker_size = kHashMarker.size();
+  } else {
+    position = at_position;
+    marker_size = kAtMarker.size();
+  }
+  size_t start = position + marker_size;
+  while (start < view.size() &&
+         std::isspace(static_cast<unsigned char>(view[start])) &&
+         view[start] != '\r' && view[start] != '\n') {
+    start++;
+  }
+  size_t end = view.find_first_of("\r\n", start);
+  if (end == std::string_view::npos) end = view.size();
+  while (end > start &&
+         std::isspace(static_cast<unsigned char>(view[end - 1]))) {
+    end--;
+  }
+  return std::string(view.substr(start, end - start));
+}
+
+struct CallerLocation {
+  int script_id = Message::kNoScriptIdInfo;
+  int line = 0;
+  int column = 0;
+  Local<String> script_name;
+};
+
+CallerLocation GetCallerLocation(Isolate* isolate) {
+  CallerLocation result;
+  Local<StackTrace> stack;
+  if (!GetCurrentStackTrace(isolate, 8).ToLocal(&stack)) return result;
+  for (int index = 0; index < stack->GetFrameCount(); index++) {
+    Local<StackFrame> frame = stack->GetFrame(isolate, index);
+    result.script_id = frame->GetScriptId();
+    result.line = frame->GetLineNumber();
+    result.column = frame->GetColumn();
+    result.script_name = frame->GetScriptName();
+    return result;
+  }
+  return result;
+}
+
+bool ReadActiveControl(Local<Context> context, Local<Object> data) {
+  Local<Value> active;
+  return data->Get(context, OneByteString(Isolate::GetCurrent(), "active"))
+             .ToLocal(&active) &&
+         active->IsTrue();
+}
+
+void ReplaceSourceControl(const FunctionCallbackInfo<Value>& args) {
+  Environment* env = Environment::GetCurrent(args);
+  Local<Context> context = env->context();
+  Local<Object> data = args.Data().As<Object>();
+  if (!ReadActiveControl(context, data)) {
+    env->ThrowError("code generation control is no longer active");
+    return;
+  }
+  if (args.Length() < 1 || !args[0]->IsString()) {
+    env->ThrowTypeError("replaceSource requires a string");
+    return;
+  }
+  SetDiagnosticProperty(context, data, "replacement", args[0]);
+  args.GetReturnValue().Set(true);
+}
+
+void ReplaceExceptionControl(const FunctionCallbackInfo<Value>& args) {
+  Environment* env = Environment::GetCurrent(args);
+  Local<Context> context = env->context();
+  Local<Object> data = args.Data().As<Object>();
+  if (!ReadActiveControl(context, data)) {
+    env->ThrowError("exception control is no longer active");
+    return;
+  }
+  Local<Value> replacement =
+      args.Length() == 0 ? Undefined(args.GetIsolate()) : args[0];
+  SetDiagnosticProperty(context, data, "replacement", replacement);
+  SetDiagnosticProperty(
+      context, data, "hasReplacement", Boolean::New(args.GetIsolate(), true));
+  args.GetReturnValue().Set(true);
+}
+
+void DisposeDiagnosticsCallback(const FunctionCallbackInfo<Value>& args) {
+  Environment* env = Environment::GetCurrent(args);
+  DiagnosticsState* state = GetDiagnosticsState(env, false);
+  if (state == nullptr || !args.Data()->IsObject()) {
+    args.GetReturnValue().Set(false);
+    return;
+  }
+  Local<Context> context = env->context();
+  Local<Object> data = args.Data().As<Object>();
+  Local<Value> type;
+  Local<Value> generation_value;
+  if (!data->Get(context, OneByteString(args.GetIsolate(), "type"))
+           .ToLocal(&type) ||
+      !data->Get(context, OneByteString(args.GetIsolate(), "generation"))
+           .ToLocal(&generation_value) ||
+      !type->IsString() || !generation_value->IsNumber()) {
+    args.GetReturnValue().Set(false);
+    return;
+  }
+  Utf8Value type_text(args.GetIsolate(), type);
+  const uint64_t generation =
+      static_cast<uint64_t>(generation_value.As<Number>()->Value());
+  bool disposed = false;
+  if (type_text.ToStringView() == "codegen" &&
+      generation == state->code_generation_callback_generation) {
+    state->code_generation_callback.Reset();
+    state->code_generation_context.Reset();
+    state->code_generation_target_context.Reset();
+    state->code_generation_callback_generation++;
+    disposed = true;
+  } else if (type_text.ToStringView() == "exception" &&
+             generation == state->exception_callback_generation) {
+    state->exception_callback.Reset();
+    state->exception_context.Reset();
+    state->exception_target_context.Reset();
+    state->exception_callback_generation++;
+    disposed = true;
+  }
+  args.GetReturnValue().Set(disposed);
+}
+
+Local<Function> CreateDisposer(Environment* env,
+                               const char* type,
+                               uint64_t generation) {
+  Isolate* isolate = env->isolate();
+  Local<Context> context = env->context();
+  Local<Object> data = Object::New(isolate);
+  SetDiagnosticProperty(context, data, "type", OneByteString(isolate, type));
+  SetDiagnosticProperty(
+      context, data, "generation", Number::New(isolate, generation));
+  return Function::New(context, DisposeDiagnosticsCallback, data)
+      .ToLocalChecked();
+}
+
+bool ReadBooleanOption(Environment* env,
+                       Local<Object> options,
+                       const char* name,
+                       bool default_value) {
+  Local<Value> value;
+  if (!options->Get(env->context(), OneByteString(env->isolate(), name))
+           .ToLocal(&value) ||
+      value->IsUndefined()) {
+    return default_value;
+  }
+  return value->BooleanValue(env->isolate());
+}
+
+std::string ReadStringOption(Environment* env,
+                             Local<Object> options,
+                             const char* name,
+                             std::string default_value) {
+  Local<Value> value;
+  if (!options->Get(env->context(), OneByteString(env->isolate(), name))
+           .ToLocal(&value) ||
+      value->IsUndefined() || !value->IsString()) {
+    return default_value;
+  }
+  Utf8Value text(env->isolate(), value);
+  return *text == nullptr
+             ? std::move(default_value)
+             : std::string(*text, static_cast<size_t>(text.length()));
+}
+
+bool ReadTargetContextOption(Environment* env,
+                             Local<Object> options,
+                             Local<Context>* result) {
+  Local<Value> value;
+  if (!options->Get(env->context(), OneByteString(env->isolate(), "context"))
+           .ToLocal(&value) ||
+      value->IsNullOrUndefined()) {
+    *result = Local<Context>();
+    return true;
+  }
+  if (!value->IsObject()) {
+    env->ThrowTypeError("diagnostics context must be a contextified vm object");
+    return false;
+  }
+  contextify::ContextifyContext* context =
+      contextify::ContextifyContext::ContextFromContextifiedSandbox(
+          env, value.As<Object>());
+  if (context == nullptr) {
+    env->ThrowTypeError("diagnostics context must be a contextified vm object");
+    return false;
+  }
+  *result = context->context();
+  return true;
+}
+
+void SetCodeGenerationCallbackBinding(const FunctionCallbackInfo<Value>& args) {
+  Environment* env = Environment::GetCurrent(args);
+  if (args.Length() < 1 || !args[0]->IsFunction()) {
+    env->ThrowTypeError("setCodeGenerationCallback requires a function");
+    return;
+  }
+  Local<Object> options = Object::New(args.GetIsolate());
+  if (args.Length() >= 2 && !args[1]->IsUndefined()) {
+    if (!args[1]->IsObject()) {
+      env->ThrowTypeError("code generation callback options must be an object");
+      return;
+    }
+    options = args[1].As<Object>();
+  }
+  DiagnosticsState* state = GetDiagnosticsState(env, true);
+  Local<Context> target_context;
+  if (!ReadTargetContextOption(env, options, &target_context)) return;
+  state->code_generation_callback.Reset(args.GetIsolate(),
+                                        args[0].As<Function>());
+  state->code_generation_context.Reset(args.GetIsolate(), env->context());
+  if (target_context.IsEmpty()) {
+    state->code_generation_target_context.Reset();
+  } else {
+    state->code_generation_target_context.Reset(args.GetIsolate(),
+                                                target_context);
+  }
+  state->root_source_id =
+      ReadStringOption(env, options, "rootSource", "target-entry");
+  state->include_vm_compile =
+      ReadBooleanOption(env, options, "includeVmCompile", true);
+  state->code_generation_callback_generation++;
+  args.GetReturnValue().Set(CreateDisposer(
+      env, "codegen", state->code_generation_callback_generation));
+}
+
+void SetUncaughtExceptionCallbackBinding(
+    const FunctionCallbackInfo<Value>& args) {
+  Environment* env = Environment::GetCurrent(args);
+  if (args.Length() < 1 || !args[0]->IsFunction()) {
+    env->ThrowTypeError("setUncaughtExceptionCallback requires a function");
+    return;
+  }
+  Local<Object> options = Object::New(args.GetIsolate());
+  if (args.Length() >= 2 && !args[1]->IsUndefined()) {
+    if (!args[1]->IsObject()) {
+      env->ThrowTypeError("exception callback options must be an object");
+      return;
+    }
+    options = args[1].As<Object>();
+  }
+  DiagnosticsState* state = GetDiagnosticsState(env, true);
+  Local<Context> target_context;
+  if (!ReadTargetContextOption(env, options, &target_context)) return;
+  state->exception_callback.Reset(args.GetIsolate(), args[0].As<Function>());
+  state->exception_context.Reset(args.GetIsolate(), env->context());
+  if (target_context.IsEmpty()) {
+    state->exception_target_context.Reset();
+  } else {
+    state->exception_target_context.Reset(args.GetIsolate(), target_context);
+  }
+  state->include_confirmed_unhandled_rejection = ReadBooleanOption(
+      env, options, "includeConfirmedUnhandledRejection", true);
+  state->root_source_id =
+      ReadStringOption(env, options, "rootSource", state->root_source_id);
+  state->exception_callback_generation++;
+  args.GetReturnValue().Set(
+      CreateDisposer(env, "exception", state->exception_callback_generation));
+}
+
+void GetCodeGenerationRecordsBinding(const FunctionCallbackInfo<Value>& args) {
+  Environment* env = Environment::GetCurrent(args);
+  DiagnosticsState* state = GetDiagnosticsState(env, false);
+  Isolate* isolate = args.GetIsolate();
+  Local<Context> context = env->context();
+  const size_t count =
+      state == nullptr ? 0 : state->code_generation_records.size();
+  Local<v8::Array> records = v8::Array::New(isolate, static_cast<int>(count));
+  if (state != nullptr) {
+    uint32_t index = 0;
+    for (const CodeGenerationRecord& record : state->code_generation_records) {
+      Local<Object> item = Object::New(isolate);
+      SetDiagnosticProperty(
+          context, item, "codegenId", Number::New(isolate, record.id));
+      SetDiagnosticProperty(
+          context, item, "kind", DiagnosticString(isolate, record.kind));
+      SetDiagnosticProperty(context,
+                            item,
+                            "sourceHash",
+                            DiagnosticString(isolate, record.source_hash));
+      SetDiagnosticProperty(context,
+                            item,
+                            "rootSourceId",
+                            DiagnosticString(isolate, record.root_source_id));
+      SetDiagnosticProperty(context,
+                            item,
+                            "parentScriptId",
+                            Integer::New(isolate, record.parent_script_id));
+      SetDiagnosticProperty(
+          context, item, "replaced", Boolean::New(isolate, record.replaced));
+      SetDiagnosticProperty(context,
+                            item,
+                            "callbackError",
+                            Boolean::New(isolate, record.callback_error));
+      records->Set(context, index++, item).Check();
+    }
+  }
+  args.GetReturnValue().Set(records);
+}
+
+void GetExceptionRecordsBinding(const FunctionCallbackInfo<Value>& args) {
+  Environment* env = Environment::GetCurrent(args);
+  DiagnosticsState* state = GetDiagnosticsState(env, false);
+  Isolate* isolate = args.GetIsolate();
+  Local<Context> context = env->context();
+  const size_t count = state == nullptr ? 0 : state->exception_records.size();
+  Local<v8::Array> records = v8::Array::New(isolate, static_cast<int>(count));
+  if (state != nullptr) {
+    uint32_t index = 0;
+    for (const ExceptionRecord& record : state->exception_records) {
+      Local<Object> item = Object::New(isolate);
+      SetDiagnosticProperty(
+          context, item, "exceptionId", Number::New(isolate, record.id));
+      SetDiagnosticProperty(
+          context, item, "origin", DiagnosticString(isolate, record.origin));
+      SetDiagnosticProperty(context,
+                            item,
+                            "rootSourceId",
+                            DiagnosticString(isolate, record.root_source_id));
+      SetDiagnosticProperty(
+          context, item, "scriptId", Integer::New(isolate, record.script_id));
+      SetDiagnosticProperty(
+          context, item, "line", Integer::New(isolate, record.line));
+      SetDiagnosticProperty(
+          context, item, "column", Integer::New(isolate, record.column));
+      SetDiagnosticProperty(
+          context, item, "replaced", Boolean::New(isolate, record.replaced));
+      SetDiagnosticProperty(context,
+                            item,
+                            "callbackError",
+                            Boolean::New(isolate, record.callback_error));
+      records->Set(context, index++, item).Check();
+    }
+  }
+  args.GetReturnValue().Set(records);
+}
 
 struct ProcessClockSnapshot {
   bool enabled;
@@ -912,9 +1410,443 @@ void Initialize(Local<Object> target,
   SetMethod(context, target, "commitExternalCall", CommitExternalCallBinding);
   SetMethod(context, target, "abortExternalCall", AbortExternalCallBinding);
   SetMethod(context, target, "getState", GetStateBinding);
+  SetMethod(context,
+            target,
+            "setCodeGenerationCallback",
+            SetCodeGenerationCallbackBinding);
+  SetMethod(context,
+            target,
+            "setUncaughtExceptionCallback",
+            SetUncaughtExceptionCallbackBinding);
+  SetMethod(context,
+            target,
+            "getCodeGenerationRecords",
+            GetCodeGenerationRecordsBinding);
+  SetMethod(context, target, "getExceptionRecords", GetExceptionRecordsBinding);
 }
 
 }  // namespace
+
+bool ApplyCodeGenerationCallback(Environment* env,
+                                 Local<Context> target_context,
+                                 const char* kind,
+                                 Local<String> source,
+                                 Local<v8::Array> parameters,
+                                 Local<Value> resource_name,
+                                 Local<String>* result) {
+  *result = source;
+  DiagnosticsState* state = GetDiagnosticsState(env, false);
+  if (state == nullptr || state->code_generation_callback.IsEmpty() ||
+      state->in_codegen_callback || !env->can_call_into_js()) {
+    return true;
+  }
+  if (!state->include_vm_compile && std::string_view(kind).starts_with("vm.")) {
+    return true;
+  }
+
+  Isolate* isolate = env->isolate();
+  if (!state->code_generation_target_context.IsEmpty() &&
+      state->code_generation_target_context.Get(isolate) != target_context) {
+    return true;
+  }
+  CallerLocation caller = GetCallerLocation(isolate);
+  const uint64_t codegen_id = NextSafeSequence(&state->next_codegen_id);
+  const uint64_t host_monotonic_ns = uv_hrtime();
+  const int context_id = target_context->Global()->GetIdentityHash();
+  const std::string source_hash = Sha256(source);
+  const size_t source_length = static_cast<size_t>(source->Length());
+
+  CodeGenerationRecord record{
+      .id = codegen_id,
+      .kind = kind,
+      .source_hash = source_hash,
+      .root_source_id = state->root_source_id,
+      .context_id = context_id,
+      .parent_script_id = caller.script_id,
+      .caller_line = caller.line,
+      .caller_column = caller.column,
+      .worker_id = env->thread_id(),
+      .host_monotonic_ns = host_monotonic_ns,
+      .source_length = source_length,
+  };
+
+  Local<Context> callback_context = state->code_generation_context.Get(isolate);
+  Local<Function> callback = state->code_generation_callback.Get(isolate);
+  if (callback_context.IsEmpty() || callback.IsEmpty()) return true;
+
+  Context::Scope callback_scope(callback_context);
+  Local<Object> info = Object::New(isolate);
+  SetDiagnosticProperty(
+      callback_context, info, "codegenId", Number::New(isolate, codegen_id));
+  SetDiagnosticProperty(
+      callback_context, info, "kind", OneByteString(isolate, kind));
+  SetDiagnosticProperty(callback_context, info, "source", source);
+  SetDiagnosticProperty(callback_context, info, "parameters", parameters);
+  SetDiagnosticProperty(callback_context,
+                        info,
+                        "sourceHash",
+                        DiagnosticString(isolate, source_hash));
+  SetDiagnosticProperty(
+      callback_context,
+      info,
+      "realmGeneration",
+      Number::New(isolate,
+                  GetController(target_context) == nullptr
+                      ? 0
+                      : GetController(target_context)->generation()));
+  SetDiagnosticProperty(
+      callback_context, info, "contextId", Integer::New(isolate, context_id));
+  SetDiagnosticProperty(callback_context,
+                        info,
+                        "workerId",
+                        Number::New(isolate, env->thread_id()));
+  SetDiagnosticProperty(
+      callback_context,
+      info,
+      "parentScriptId",
+      caller.script_id == Message::kNoScriptIdInfo
+          ? Null(isolate).As<Value>()
+          : Integer::New(isolate, caller.script_id).As<Value>());
+  SetDiagnosticProperty(
+      callback_context, info, "parentCodegenId", Null(isolate));
+  SetDiagnosticProperty(callback_context,
+                        info,
+                        "rootSourceId",
+                        DiagnosticString(isolate, state->root_source_id));
+  SetDiagnosticProperty(
+      callback_context, info, "callerLine", Integer::New(isolate, caller.line));
+  SetDiagnosticProperty(callback_context,
+                        info,
+                        "callerColumn",
+                        Integer::New(isolate, caller.column));
+  Local<Value> source_url = resource_name;
+  if (source_url.IsEmpty() || source_url->IsUndefined()) {
+    const std::string extracted_source_url = ExtractSourceURL(source);
+    if (!extracted_source_url.empty()) {
+      source_url = DiagnosticString(isolate, extracted_source_url);
+    } else {
+      source_url = caller.script_name.IsEmpty()
+                       ? Null(isolate).As<Value>()
+                       : caller.script_name.As<Value>();
+    }
+  }
+  SetDiagnosticProperty(callback_context, info, "sourceURL", source_url);
+  SetDiagnosticProperty(
+      callback_context,
+      info,
+      "hostMonotonicNs",
+      v8::BigInt::NewFromUnsigned(isolate, host_monotonic_ns));
+  SetDiagnosticProperty(callback_context,
+                        info,
+                        "compileResult",
+                        OneByteString(isolate, "attempt"));
+
+  Local<Object> control_data = Object::New(isolate);
+  SetDiagnosticProperty(
+      callback_context, control_data, "active", Boolean::New(isolate, true));
+  SetDiagnosticProperty(
+      callback_context, control_data, "replacement", Undefined(isolate));
+  Local<Object> control = Object::New(isolate);
+  Local<Function> replace_source =
+      Function::New(callback_context, ReplaceSourceControl, control_data)
+          .ToLocalChecked();
+  SetDiagnosticProperty(
+      callback_context, control, "replaceSource", replace_source);
+
+  v8::TryCatch try_catch(isolate);
+  try_catch.SetVerbose(false);
+  Local<Value> argv[2] = {info, control};
+  state->in_codegen_callback = true;
+  MaybeLocal<Value> maybe_callback_result = callback->Call(
+      callback_context, Undefined(isolate), arraysize(argv), argv);
+  state->in_codegen_callback = false;
+  SetDiagnosticProperty(
+      callback_context, control_data, "active", Boolean::New(isolate, false));
+
+  if (maybe_callback_result.IsEmpty()) {
+    record.callback_error = true;
+    try_catch.Reset();
+  } else {
+    Local<Value> replacement;
+    if (control_data
+            ->Get(callback_context, OneByteString(isolate, "replacement"))
+            .ToLocal(&replacement) &&
+        replacement->IsString()) {
+      Utf8Value replacement_text(isolate, replacement);
+      Local<String> flattened_replacement;
+      if (*replacement_text != nullptr &&
+          String::NewFromUtf8(isolate,
+                              *replacement_text,
+                              v8::NewStringType::kNormal,
+                              replacement_text.length())
+              .ToLocal(&flattened_replacement)) {
+        *result = flattened_replacement;
+        record.replaced = true;
+      }
+    }
+  }
+
+  if (state->code_generation_records.size() == kDiagnosticsRecordLimit) {
+    state->code_generation_records.pop_front();
+  }
+  state->code_generation_records.push_back(std::move(record));
+  return true;
+}
+
+v8::ModifyCodeGenerationFromStringsResult ModifyCodeGenerationFromStrings(
+    Environment* env,
+    Local<Context> context,
+    Local<Value> source,
+    bool is_code_like,
+    bool codegen_allowed) {
+  if (!codegen_allowed || !source->IsString()) {
+    return {codegen_allowed, {}};
+  }
+  Isolate* isolate = env->isolate();
+  EscapableHandleScope scope(isolate);
+  Local<String> original = source.As<String>();
+  const std::string kind = ClassifyStringCodeGeneration(original);
+  Local<String> replacement;
+  if (!ApplyCodeGenerationCallback(env,
+                                   context,
+                                   kind.c_str(),
+                                   original,
+                                   v8::Array::New(isolate),
+                                   Undefined(isolate),
+                                   &replacement)) {
+    return {false, {}};
+  }
+  if (replacement == original) return {true, {}};
+  return {true, scope.Escape(replacement)};
+}
+
+Local<Value> InterceptUncaughtException(Environment* env,
+                                        Local<Value> exception,
+                                        Local<Message> message,
+                                        bool from_promise) {
+  Isolate* isolate = env->isolate();
+  EscapableHandleScope scope(isolate);
+  DiagnosticsState* state = GetDiagnosticsState(env, false);
+  if (state == nullptr || state->exception_callback.IsEmpty() ||
+      state->in_exception_callback || !env->can_call_into_js() ||
+      (from_promise && !state->include_confirmed_unhandled_rejection)) {
+    return scope.Escape(exception);
+  }
+
+  Local<Context> target_context = isolate->GetCurrentContext();
+  Local<Context> realm_context =
+      state->exception_target_context.IsEmpty()
+          ? target_context
+          : state->exception_target_context.Get(isolate);
+  Local<Context> callback_context = state->exception_context.Get(isolate);
+  Local<Function> callback = state->exception_callback.Get(isolate);
+  if (callback_context.IsEmpty() || callback.IsEmpty()) {
+    return scope.Escape(exception);
+  }
+
+  const uint64_t exception_id = NextSafeSequence(&state->next_exception_id);
+  const uint64_t host_monotonic_ns = uv_hrtime();
+  const char* origin =
+      from_promise ? "unhandledRejection" : "uncaughtException";
+  const int script_id = message->GetScriptOrigin().ScriptId();
+  const int line = message->GetLineNumber(target_context).FromMaybe(0);
+  const int column = message->GetStartColumn();
+  Local<Value> exception_source_url = message->GetScriptResourceName();
+  if (exception_source_url.IsEmpty()) {
+    exception_source_url = Null(isolate);
+  }
+  Local<String> exception_script_name = exception_source_url->IsString()
+                                            ? exception_source_url.As<String>()
+                                            : String::Empty(isolate);
+  RealmTimeController* controller = GetController(realm_context);
+  if (controller == nullptr) controller = GetCurrentController(isolate);
+  if (controller == nullptr &&
+      process_clock.enabled.load(std::memory_order_acquire)) {
+    controller = const_cast<RealmTimeController*>(
+        process_clock.owner.load(std::memory_order_acquire));
+  }
+
+  ExceptionRecord record{
+      .id = exception_id,
+      .origin = origin,
+      .root_source_id = state->root_source_id,
+      .context_id = realm_context->Global()->GetIdentityHash(),
+      .script_id = script_id,
+      .line = line,
+      .column = column,
+      .worker_id = env->thread_id(),
+      .host_monotonic_ns = host_monotonic_ns,
+  };
+
+  Context::Scope callback_scope(callback_context);
+  Local<Object> info = Object::New(isolate);
+  SetDiagnosticProperty(callback_context,
+                        info,
+                        "exceptionId",
+                        Number::New(isolate, exception_id));
+  SetDiagnosticProperty(
+      callback_context, info, "origin", OneByteString(isolate, origin));
+  SetDiagnosticProperty(
+      callback_context,
+      info,
+      "realmGeneration",
+      Number::New(isolate,
+                  controller == nullptr ? 0 : controller->generation()));
+  SetDiagnosticProperty(
+      callback_context,
+      info,
+      "transactionId",
+      controller == nullptr ||
+              controller->active_token() == RealmTimeController::kInvalidToken
+          ? Null(isolate).As<Value>()
+          : Number::New(isolate, controller->active_token()).As<Value>());
+  SetDiagnosticProperty(callback_context,
+                        info,
+                        "contextId",
+                        Integer::New(isolate, record.context_id));
+  SetDiagnosticProperty(callback_context,
+                        info,
+                        "workerId",
+                        Number::New(isolate, env->thread_id()));
+  SetDiagnosticProperty(callback_context,
+                        info,
+                        "executionAsyncId",
+                        Number::New(isolate, env->execution_async_id()));
+  SetDiagnosticProperty(callback_context,
+                        info,
+                        "triggerAsyncId",
+                        Number::New(isolate, env->trigger_async_id()));
+  SetDiagnosticProperty(
+      callback_context, info, "scriptId", Integer::New(isolate, script_id));
+  SetDiagnosticProperty(callback_context,
+                        info,
+                        "parentSourceId",
+                        script_id == Message::kNoScriptIdInfo
+                            ? Null(isolate).As<Value>()
+                            : Integer::New(isolate, script_id).As<Value>());
+  SetDiagnosticProperty(callback_context,
+                        info,
+                        "rootSourceId",
+                        DiagnosticString(isolate, state->root_source_id));
+  SetDiagnosticProperty(
+      callback_context, info, "line", Integer::New(isolate, line));
+  SetDiagnosticProperty(
+      callback_context, info, "column", Integer::New(isolate, column));
+  SetDiagnosticProperty(
+      callback_context, info, "sourceURL", exception_source_url);
+  SetDiagnosticProperty(
+      callback_context,
+      info,
+      "hostMonotonicNs",
+      v8::BigInt::NewFromUnsigned(isolate, host_monotonic_ns));
+  const uint64_t realm_time_ns = static_cast<uint64_t>(
+      std::max(0.0, CurrentMonotonicTimeNanoseconds(host_monotonic_ns)));
+  SetDiagnosticProperty(callback_context,
+                        info,
+                        "realmTimeNs",
+                        v8::BigInt::NewFromUnsigned(isolate, realm_time_ns));
+  SetDiagnosticProperty(
+      callback_context, info, "handled", Boolean::New(isolate, false));
+  SetDiagnosticProperty(callback_context,
+                        info,
+                        "escalatedFromRejection",
+                        Boolean::New(isolate, from_promise));
+
+  Local<StackTrace> stack = Exception::GetStackTrace(exception);
+  if (stack.IsEmpty()) stack = message->GetStackTrace();
+  const int frame_count = stack.IsEmpty() ? 0 : stack->GetFrameCount();
+  Local<v8::Array> frames =
+      v8::Array::New(isolate, frame_count == 0 ? 1 : frame_count);
+  if (frame_count == 0) {
+    Local<Object> frame_info = Object::New(isolate);
+    SetDiagnosticProperty(callback_context,
+                          frame_info,
+                          "scriptId",
+                          Integer::New(isolate, script_id));
+    SetDiagnosticProperty(
+        callback_context, frame_info, "line", Integer::New(isolate, line));
+    SetDiagnosticProperty(
+        callback_context, frame_info, "column", Integer::New(isolate, column));
+    SetDiagnosticProperty(
+        callback_context, frame_info, "functionName", String::Empty(isolate));
+    SetDiagnosticProperty(
+        callback_context, frame_info, "scriptName", exception_script_name);
+    frames->Set(callback_context, 0, frame_info).Check();
+  }
+  for (int index = 0; index < frame_count; index++) {
+    Local<StackFrame> frame = stack->GetFrame(isolate, index);
+    Local<Object> frame_info = Object::New(isolate);
+    SetDiagnosticProperty(callback_context,
+                          frame_info,
+                          "scriptId",
+                          Integer::New(isolate, frame->GetScriptId()));
+    SetDiagnosticProperty(callback_context,
+                          frame_info,
+                          "line",
+                          Integer::New(isolate, frame->GetLineNumber()));
+    SetDiagnosticProperty(callback_context,
+                          frame_info,
+                          "column",
+                          Integer::New(isolate, frame->GetColumn()));
+    SetDiagnosticProperty(
+        callback_context, frame_info, "functionName", frame->GetFunctionName());
+    SetDiagnosticProperty(
+        callback_context, frame_info, "scriptName", frame->GetScriptName());
+    frames->Set(callback_context, index, frame_info).Check();
+  }
+  SetDiagnosticProperty(callback_context, info, "frames", frames);
+
+  Local<Object> control_data = Object::New(isolate);
+  SetDiagnosticProperty(
+      callback_context, control_data, "active", Boolean::New(isolate, true));
+  SetDiagnosticProperty(callback_context,
+                        control_data,
+                        "hasReplacement",
+                        Boolean::New(isolate, false));
+  SetDiagnosticProperty(
+      callback_context, control_data, "replacement", Undefined(isolate));
+  Local<Object> control = Object::New(isolate);
+  Local<Function> replace =
+      Function::New(callback_context, ReplaceExceptionControl, control_data)
+          .ToLocalChecked();
+  SetDiagnosticProperty(callback_context, control, "replace", replace);
+
+  v8::TryCatch try_catch(isolate);
+  try_catch.SetVerbose(false);
+  Local<Value> argv[3] = {exception, info, control};
+  state->in_exception_callback = true;
+  MaybeLocal<Value> maybe_callback_result = callback->Call(
+      callback_context, Undefined(isolate), arraysize(argv), argv);
+  state->in_exception_callback = false;
+  SetDiagnosticProperty(
+      callback_context, control_data, "active", Boolean::New(isolate, false));
+
+  Local<Value> result = exception;
+  if (maybe_callback_result.IsEmpty()) {
+    record.callback_error = true;
+    try_catch.Reset();
+  } else {
+    Local<Value> has_replacement;
+    if (control_data
+            ->Get(callback_context, OneByteString(isolate, "hasReplacement"))
+            .ToLocal(&has_replacement) &&
+        has_replacement->IsTrue()) {
+      Local<Value> replacement;
+      if (control_data
+              ->Get(callback_context, OneByteString(isolate, "replacement"))
+              .ToLocal(&replacement)) {
+        result = replacement;
+        record.replaced = true;
+      }
+    }
+  }
+
+  if (state->exception_records.size() == kDiagnosticsRecordLimit) {
+    state->exception_records.pop_front();
+  }
+  state->exception_records.push_back(std::move(record));
+  return scope.Escape(result);
+}
 
 bool RealmTimeController::Enable(double real_wall_time_ms,
                                  uint64_t real_monotonic_time_ns,
@@ -1281,6 +2213,13 @@ void RegisterExternalReferences(ExternalReferenceRegistry* registry) {
   registry->Register(CommitExternalCallBinding);
   registry->Register(AbortExternalCallBinding);
   registry->Register(GetStateBinding);
+  registry->Register(SetCodeGenerationCallbackBinding);
+  registry->Register(SetUncaughtExceptionCallbackBinding);
+  registry->Register(GetCodeGenerationRecordsBinding);
+  registry->Register(GetExceptionRecordsBinding);
+  registry->Register(DisposeDiagnosticsCallback);
+  registry->Register(ReplaceSourceControl);
+  registry->Register(ReplaceExceptionControl);
 }
 
 }  // namespace node::realm_time

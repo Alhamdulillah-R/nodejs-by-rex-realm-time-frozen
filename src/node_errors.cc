@@ -8,6 +8,7 @@
 #include "node_external_reference.h"
 #include "node_internals.h"
 #include "node_process-inl.h"
+#include "node_realm_time.h"
 #include "node_report.h"
 #include "node_v8_platform-inl.h"
 #include "util-inl.h"
@@ -627,7 +628,8 @@ v8::ModifyCodeGenerationFromStringsResult ModifyCodeGenerationFromStrings(
     v8::Local<v8::Context> context,
     v8::Local<v8::Value> source,
     bool is_code_like) {
-  HandleScope scope(Isolate::GetCurrent());
+  Isolate* isolate = Isolate::GetCurrent();
+  EscapableHandleScope scope(isolate);
 
   if (context->GetNumberOfEmbedderDataFields() <=
       ContextEmbedderIndex::kAllowCodeGenerationFromStrings) {
@@ -659,10 +661,14 @@ v8::ModifyCodeGenerationFromStringsResult ModifyCodeGenerationFromStrings(
       ContextEmbedderIndex::kAllowCodeGenerationFromStrings);
   bool codegen_allowed =
       allow_code_gen->IsUndefined() || allow_code_gen->IsTrue();
-  return {
-      codegen_allowed,
-      {},
-  };
+  v8::ModifyCodeGenerationFromStringsResult result =
+      realm_time::ModifyCodeGenerationFromStrings(
+          env, context, source, is_code_like, codegen_allowed);
+  Local<String> modified_source;
+  if (result.modified_source.ToLocal(&modified_source)) {
+    result.modified_source = scope.Escape(modified_source);
+  }
+  return result;
 }
 
 // Check if an exception is a stack overflow error (RangeError with
@@ -1288,6 +1294,13 @@ void TriggerUncaughtException(Isolate* isolate,
     PrintToStderrAndFlush(
         FormatCaughtException(isolate, context, error, message));
     ABORT();
+  }
+
+  Local<Value> intercepted_error =
+      realm_time::InterceptUncaughtException(env, error, message, from_promise);
+  if (intercepted_error != error) {
+    error = intercepted_error;
+    message = Exception::CreateMessage(isolate, error);
   }
 
   // Invoke process._fatalException() to give user a chance to handle it.
