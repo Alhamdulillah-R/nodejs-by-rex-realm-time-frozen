@@ -87,6 +87,7 @@ class RealmTimeController final {
     std::string operation;
     bool parked = false;
     bool release_required = false;
+    bool transport_released = false;
     double committed_duration_ms = 0;
   };
 
@@ -100,6 +101,10 @@ class RealmTimeController final {
   bool Resume(double committed_duration_ms,
               double real_wall_time_ms,
               uint64_t real_monotonic_time_ns);
+  bool AdvanceFrozen(double committed_duration_ms);
+  bool ResumeCommitted(double real_wall_time_ms,
+                       uint64_t real_monotonic_time_ns);
+  void WaitFunctionDuration(double function_duration_ms) const;
   TransactionResult FindCompleted(uint64_t token,
                                   bool committed,
                                   double function_duration_ms,
@@ -122,7 +127,6 @@ class RealmTimeController final {
   std::vector<ExternalCallFrame> frames_;
   std::vector<CompletedCall> completed_calls_;
   uint64_t pending_release_token_ = kInvalidToken;
-  double pending_release_duration_ms_ = 0;
 };
 
 RealmTimeController* GetController(v8::Local<v8::Context> context);

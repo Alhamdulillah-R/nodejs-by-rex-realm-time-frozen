@@ -12,6 +12,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cctype>
 #include <cerrno>
 #include <cmath>
@@ -23,6 +24,7 @@
 #include <mutex>
 #include <sstream>
 #include <string_view>
+#include <thread>
 #include <unordered_map>
 
 #ifdef _WIN32
@@ -649,6 +651,23 @@ bool ResumeProcessClock(const RealmTimeController* owner,
   process_clock.monotonic_time_offset_ns.store(monotonic_time_offset_ns,
                                                std::memory_order_relaxed);
   process_clock.frozen.store(false, std::memory_order_relaxed);
+  EndProcessClockWrite();
+  return true;
+}
+
+bool AdvanceFrozenProcessClock(const RealmTimeController* owner,
+                               double wall_time_ms,
+                               double monotonic_time_ns) {
+  if (process_clock.owner.load(std::memory_order_acquire) != owner ||
+      !std::isfinite(wall_time_ms) || !std::isfinite(monotonic_time_ns)) {
+    return false;
+  }
+  BeginProcessClockWrite();
+  process_clock.frozen_wall_time_ms.store(wall_time_ms,
+                                          std::memory_order_relaxed);
+  process_clock.frozen_monotonic_time_ns.store(monotonic_time_ns,
+                                               std::memory_order_relaxed);
+  process_clock.frozen.store(true, std::memory_order_relaxed);
   EndProcessClockWrite();
   return true;
 }
@@ -1872,7 +1891,6 @@ bool RealmTimeController::Enable(double real_wall_time_ms,
   frames_.clear();
   completed_calls_.clear();
   pending_release_token_ = kInvalidToken;
-  pending_release_duration_ms_ = 0;
   return true;
 }
 
@@ -1890,7 +1908,6 @@ void RealmTimeController::Disable() {
   frames_.clear();
   completed_calls_.clear();
   pending_release_token_ = kInvalidToken;
-  pending_release_duration_ms_ = 0;
 }
 
 uint64_t RealmTimeController::NextToken() {
@@ -1930,7 +1947,7 @@ uint64_t RealmTimeController::BeginExternalCall(double real_wall_time_ms,
     }
     return kInvalidToken;
   }
-  frames_.push_back({token, std::move(operation), false, false, 0});
+  frames_.push_back({token, std::move(operation), false, false, false, 0});
   return token;
 }
 
@@ -1990,21 +2007,61 @@ RealmTimeController::TransactionResult RealmTimeController::CommitExternalCall(
   if (!std::isfinite(committed_duration_ms)) {
     return TransactionResult::kClockOverflow;
   }
-  const bool release_required = frames_.back().release_required;
+
+  // An inner transaction never owns the process release boundary.  Its
+  // browser function duration is still a synchronous phase, so keep the
+  // event loop parked while the caller's native stack simulates that work;
+  // the accumulated logical duration is applied exactly once by the outer
+  // transaction.
   if (frames_.size() > 1) {
-    double parent_duration = frames_[frames_.size() - 2].committed_duration_ms +
-                             committed_duration_ms;
-    if (!std::isfinite(parent_duration)) {
+    WaitFunctionDuration(function_duration_ms);
+    frames_[frames_.size() - 2].committed_duration_ms =
+        frames_[frames_.size() - 2].committed_duration_ms +
+        committed_duration_ms;
+    if (!std::isfinite(frames_[frames_.size() - 2].committed_duration_ms)) {
       return TransactionResult::kClockOverflow;
     }
-    frames_[frames_.size() - 2].committed_duration_ms = parent_duration;
-  } else if (release_required) {
+    frames_.pop_back();
+    RememberCompletion(token, true, function_duration_ms,
+                       timeline_adjustment_ms);
+    return TransactionResult::kOk;
+  }
+
+  const bool release_required = frames_.back().release_required;
+  const bool transport_released = frames_.back().transport_released;
+  if (release_required && !transport_released) {
+    // Compatibility path for callers that commit before sending the
+    // Controller release acknowledgement.  Apply the target duration while
+    // keeping the process clock frozen; FinalizeReleaseExternalCall will only
+    // unfreeze it after the Controller has resumed the process.
+    if (!AdvanceFrozen(committed_duration_ms)) {
+      return TransactionResult::kClockOverflow;
+    }
     pending_release_token_ = token;
-    pending_release_duration_ms_ = committed_duration_ms;
-  } else {
+  } else if (transport_released || !release_required) {
+    // The Controller transport is already over (or no hard suspension was
+    // requested).  This is the target function-execution phase: wait on the
+    // native stack without allowing the target event loop to re-enter, then
+    // atomically project functionDurationMs + timelineAdjustmentMs and
+    // return to JavaScript.
+    WaitFunctionDuration(function_duration_ms);
+    // The binding captures its arguments before entering this method.  The
+    // wait above therefore makes those timestamps stale; use the elapsed
+    // monotonic interval to reconstruct the current wall timestamp before
+    // calculating the running-clock offset.  Otherwise real wait time would
+    // be counted a second time after the logical duration.
+    const uint64_t resume_real_monotonic_time_ns = uv_hrtime();
+    const double elapsed_real_ms =
+        resume_real_monotonic_time_ns >= real_monotonic_time_ns
+            ? static_cast<double>(resume_real_monotonic_time_ns -
+                                  real_monotonic_time_ns) /
+                  kNanosecondsPerMillisecond
+            : 0;
+    const double resume_real_wall_time_ms =
+        real_wall_time_ms + elapsed_real_ms;
     if (!Resume(committed_duration_ms,
-                real_wall_time_ms,
-                real_monotonic_time_ns)) {
+                resume_real_wall_time_ms,
+                resume_real_monotonic_time_ns)) {
       return TransactionResult::kClockOverflow;
     }
   }
@@ -2025,9 +2082,13 @@ RealmTimeController::TransactionResult RealmTimeController::AbortExternalCall(
   if (frames_.empty()) return TransactionResult::kNoActiveCall;
   if (frames_.back().token != token) return TransactionResult::kOutOfOrder;
   if (frames_.size() == 1) {
-    if (frames_.back().release_required) {
+    if (frames_.back().release_required &&
+        !frames_.back().transport_released) {
       pending_release_token_ = token;
-      pending_release_duration_ms_ = 0;
+    } else if (frames_.back().transport_released) {
+      if (!ResumeCommitted(real_wall_time_ms, real_monotonic_time_ns)) {
+        return TransactionResult::kClockOverflow;
+      }
     } else if (!Resume(0, real_wall_time_ms, real_monotonic_time_ns)) {
       return TransactionResult::kClockOverflow;
     }
@@ -2043,12 +2104,17 @@ RealmTimeController::ValidateReleaseExternalCall(uint64_t token) const {
   if (!TokenHasCurrentGeneration(token)) {
     return TransactionResult::kStaleGeneration;
   }
+  for (auto it = frames_.rbegin(); it != frames_.rend(); ++it) {
+    if (it->token == token) {
+      if (it != frames_.rbegin()) return TransactionResult::kOutOfOrder;
+      if (!it->parked) return TransactionResult::kNotParked;
+      if (!it->release_required) return TransactionResult::kNotCompleted;
+      return TransactionResult::kOk;
+    }
+  }
   for (auto it = completed_calls_.rbegin(); it != completed_calls_.rend();
        ++it) {
     if (it->token == token) return TransactionResult::kOk;
-  }
-  for (auto it = frames_.rbegin(); it != frames_.rend(); ++it) {
-    if (it->token == token) return TransactionResult::kNotCompleted;
   }
   return TransactionResult::kNoActiveCall;
 }
@@ -2063,18 +2129,24 @@ RealmTimeController::FinalizeReleaseExternalCall(
     return TransactionResult::kStaleGeneration;
   }
   if (pending_release_token_ == kInvalidToken) {
+    for (auto it = frames_.rbegin(); it != frames_.rend(); ++it) {
+      if (it->token != token) continue;
+      if (it != frames_.rbegin()) return TransactionResult::kOutOfOrder;
+      if (!it->parked) return TransactionResult::kNotParked;
+      if (!it->release_required) return TransactionResult::kNotCompleted;
+      if (it->transport_released) return TransactionResult::kIdempotent;
+      it->transport_released = true;
+      return TransactionResult::kOk;
+    }
     return ValidateReleaseExternalCall(token) == TransactionResult::kOk
                ? TransactionResult::kIdempotent
                : TransactionResult::kNoActiveCall;
   }
   if (pending_release_token_ != token) return TransactionResult::kOutOfOrder;
-  if (!Resume(pending_release_duration_ms_,
-              real_wall_time_ms,
-              real_monotonic_time_ns)) {
+  if (!ResumeCommitted(real_wall_time_ms, real_monotonic_time_ns)) {
     return TransactionResult::kClockOverflow;
   }
   pending_release_token_ = kInvalidToken;
-  pending_release_duration_ms_ = 0;
   return TransactionResult::kOk;
 }
 
@@ -2099,6 +2171,83 @@ bool RealmTimeController::Resume(double committed_duration_ms,
   wall_time_offset_ms_ = wall_time_offset_ms;
   monotonic_time_offset_ns_ = monotonic_time_offset_ns;
   return true;
+}
+
+bool RealmTimeController::AdvanceFrozen(double committed_duration_ms) {
+  if (!std::isfinite(committed_duration_ms) || committed_duration_ms < 0) {
+    return false;
+  }
+  const double frozen_wall_time_ms =
+      frozen_wall_time_ms_ + committed_duration_ms;
+  const double frozen_monotonic_time_ns =
+      frozen_monotonic_time_ns_ +
+      committed_duration_ms * kNanosecondsPerMillisecond;
+  if (!std::isfinite(frozen_wall_time_ms) ||
+      !std::isfinite(frozen_monotonic_time_ns)) {
+    return false;
+  }
+  if (uv_realm_time_advance_frozen(
+          event_loop_, this, committed_duration_ms) != 0) {
+    return false;
+  }
+  if (!AdvanceFrozenProcessClock(
+          this, frozen_wall_time_ms, frozen_monotonic_time_ns)) {
+    return false;
+  }
+  frozen_wall_time_ms_ = frozen_wall_time_ms;
+  frozen_monotonic_time_ns_ = frozen_monotonic_time_ns;
+  return true;
+}
+
+bool RealmTimeController::ResumeCommitted(double real_wall_time_ms,
+                                          uint64_t real_monotonic_time_ns) {
+  const double wall_time_offset_ms =
+      frozen_wall_time_ms_ - real_wall_time_ms;
+  const double monotonic_time_offset_ns =
+      frozen_monotonic_time_ns_ - static_cast<double>(real_monotonic_time_ns);
+  if (!std::isfinite(wall_time_offset_ms) ||
+      !std::isfinite(monotonic_time_offset_ns) ||
+      uv_realm_time_resume(event_loop_, this, 0) != 0) {
+    return false;
+  }
+  if (!ResumeProcessClock(
+          this, wall_time_offset_ms, monotonic_time_offset_ns)) {
+    return false;
+  }
+  wall_time_offset_ms_ = wall_time_offset_ms;
+  monotonic_time_offset_ns_ = monotonic_time_offset_ns;
+  return true;
+}
+
+void RealmTimeController::WaitFunctionDuration(
+    double function_duration_ms) const {
+  if (!std::isfinite(function_duration_ms) || function_duration_ms <= 0) {
+    return;
+  }
+  const long double duration_ns =
+      static_cast<long double>(function_duration_ms) * 1'000'000.0L;
+  const long double max_duration_ns =
+      static_cast<long double>(std::numeric_limits<uint64_t>::max());
+  if (duration_ns >= max_duration_ns) return;
+
+  const uint64_t start = uv_hrtime();
+  const uint64_t duration = static_cast<uint64_t>(std::ceil(duration_ns));
+  if (duration > std::numeric_limits<uint64_t>::max() - start) return;
+  const uint64_t target = start + duration;
+  while (true) {
+    const uint64_t now = uv_hrtime();
+    if (now >= target) return;
+    const uint64_t remaining = target - now;
+    // Let the OS sleep for the coarse part, then yield/spin for the final
+    // 0.25ms. This keeps function-duration pacing close to the recording
+    // value without allowing JavaScript to re-enter the event loop.
+    if (remaining > 250'000) {
+      std::this_thread::sleep_for(
+          std::chrono::nanoseconds(remaining - 125'000));
+    } else {
+      std::this_thread::yield();
+    }
+  }
 }
 
 RealmTimeController::TransactionResult RealmTimeController::FindCompleted(
