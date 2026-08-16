@@ -1027,42 +1027,6 @@ int uv_realm_time_resume(uv_loop_t* loop,
 }
 
 
-int uv_realm_time_advance_frozen(uv_loop_t* loop,
-                                 const void* owner,
-                                 double advance_ms) {
-  double resumed_time_ms;
-
-  if (loop == NULL || owner == NULL || advance_ms < 0 ||
-      !isfinite(advance_ms))
-    return UV_EINVAL;
-
-  uv__realm_time_lock();
-  if (!uv__realm_time_enabled || uv__realm_time_owner != owner ||
-      !uv__realm_time_frozen) {
-    uv_mutex_unlock(&uv__realm_time_mutex);
-    return UV_EINVAL;
-  }
-  resumed_time_ms = uv__realm_time_frozen_ms + advance_ms;
-  if (!isfinite(resumed_time_ms) || resumed_time_ms < 0 ||
-      resumed_time_ms > (double) UINT64_MAX) {
-    uv_mutex_unlock(&uv__realm_time_mutex);
-    return UV_EOVERFLOW;
-  }
-
-  /* Keep the global and this loop's cached time frozen.  A later
-   * uv_realm_time_resume(..., 0) will project this committed value against
-   * the real clock without adding any transport wall time. */
-  uv__realm_time_frozen_ms = resumed_time_ms;
-  loop->time = (uint64_t) resumed_time_ms;
-  uv_mutex_unlock(&uv__realm_time_mutex);
-
-  loop->realm_time_fraction_ms =
-      resumed_time_ms - (double) ((uint64_t) resumed_time_ms);
-  loop->realm_time_frozen = 1;
-  return 0;
-}
-
-
 int uv_realm_time_is_frozen(const uv_loop_t* loop) {
   int frozen;
 

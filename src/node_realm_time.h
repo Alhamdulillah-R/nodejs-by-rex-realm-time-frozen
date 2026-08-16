@@ -33,7 +33,6 @@ class RealmTimeController final {
     kInvalidDuration,
     kClockOverflow,
     kNotParked,
-    kNotCompleted,
   };
 
   bool Enable(double real_wall_time_ms,
@@ -45,7 +44,6 @@ class RealmTimeController final {
                              uint64_t real_monotonic_time_ns,
                              std::string operation);
   TransactionResult ParkExternalCall(uint64_t token);
-  TransactionResult RequireReleaseExternalCall(uint64_t token);
   TransactionResult CommitExternalCall(uint64_t token,
                                        double function_duration_ms,
                                        double timeline_adjustment_ms,
@@ -54,31 +52,18 @@ class RealmTimeController final {
   TransactionResult AbortExternalCall(uint64_t token,
                                        double real_wall_time_ms,
                                        uint64_t real_monotonic_time_ns);
-  TransactionResult ValidateReleaseExternalCall(uint64_t token) const;
-  TransactionResult FinalizeReleaseExternalCall(
-      uint64_t token,
-      double real_wall_time_ms,
-      uint64_t real_monotonic_time_ns);
 
   double CurrentWallTimeMilliseconds(double real_wall_time_ms) const;
   double CurrentMonotonicTimeNanoseconds(uint64_t real_monotonic_time_ns) const;
 
   bool enabled() const { return enabled_; }
-  bool frozen() const {
-    return !frames_.empty() || pending_release_token_ != kInvalidToken;
-  }
+  bool frozen() const { return !frames_.empty(); }
   size_t depth() const { return frames_.size(); }
   uint64_t generation() const { return generation_; }
-  bool parked() const {
-    return pending_release_token_ != kInvalidToken ||
-           (!frames_.empty() && frames_.back().parked);
-  }
-  bool release_pending() const {
-    return pending_release_token_ != kInvalidToken;
-  }
+  bool parked() const { return !frames_.empty() && frames_.back().parked; }
   const std::string& active_operation() const;
   uint64_t active_token() const {
-    return frames_.empty() ? pending_release_token_ : frames_.back().token;
+    return frames_.empty() ? kInvalidToken : frames_.back().token;
   }
 
  private:
@@ -86,8 +71,6 @@ class RealmTimeController final {
     uint64_t token;
     std::string operation;
     bool parked = false;
-    bool release_required = false;
-    bool transport_released = false;
     double committed_duration_ms = 0;
   };
 
@@ -101,9 +84,6 @@ class RealmTimeController final {
   bool Resume(double committed_duration_ms,
               double real_wall_time_ms,
               uint64_t real_monotonic_time_ns);
-  bool AdvanceFrozen(double committed_duration_ms);
-  bool ResumeCommitted(double real_wall_time_ms,
-                       uint64_t real_monotonic_time_ns);
   void WaitFunctionDuration(double function_duration_ms) const;
   TransactionResult FindCompleted(uint64_t token,
                                   bool committed,
@@ -126,7 +106,6 @@ class RealmTimeController final {
   double frozen_monotonic_time_ns_ = 0;
   std::vector<ExternalCallFrame> frames_;
   std::vector<CompletedCall> completed_calls_;
-  uint64_t pending_release_token_ = kInvalidToken;
 };
 
 RealmTimeController* GetController(v8::Local<v8::Context> context);

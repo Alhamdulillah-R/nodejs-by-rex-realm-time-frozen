@@ -655,23 +655,6 @@ bool ResumeProcessClock(const RealmTimeController* owner,
   return true;
 }
 
-bool AdvanceFrozenProcessClock(const RealmTimeController* owner,
-                               double wall_time_ms,
-                               double monotonic_time_ns) {
-  if (process_clock.owner.load(std::memory_order_acquire) != owner ||
-      !std::isfinite(wall_time_ms) || !std::isfinite(monotonic_time_ns)) {
-    return false;
-  }
-  BeginProcessClockWrite();
-  process_clock.frozen_wall_time_ms.store(wall_time_ms,
-                                          std::memory_order_relaxed);
-  process_clock.frozen_monotonic_time_ns.store(monotonic_time_ns,
-                                               std::memory_order_relaxed);
-  process_clock.frozen.store(true, std::memory_order_relaxed);
-  EndProcessClockWrite();
-  return true;
-}
-
 ProcessClockSnapshot ReadProcessClock() {
   ProcessClockSnapshot snapshot;
   uint64_t before;
@@ -765,8 +748,7 @@ bool DecodeChunkedBody(std::string_view encoded, std::string* decoded) {
 
 bool ParseHttpResponse(std::string_view response,
                        int* status_code,
-                       std::string* body,
-                       bool* hard_suspended) {
+                       std::string* body) {
   size_t header_end = response.find("\r\n\r\n");
   if (header_end == std::string_view::npos) return false;
   std::string_view headers = response.substr(0, header_end);
@@ -815,8 +797,6 @@ bool ParseHttpResponse(std::string_view response,
           return false;
         }
         content_length = static_cast<size_t>(parsed);
-      } else if (name == "x-rex-realm-hard-suspended") {
-        *hard_suspended = value == "1";
       }
     }
     cursor = line_end + 2;
@@ -840,17 +820,15 @@ uint64_t TokenGeneration(uint64_t token) {
 struct ControllerHttpResponse {
   int status_code;
   std::string body;
-  bool hard_suspended = false;
 };
 
 bool PerformControllerPost(Environment* env,
                            uint32_t port,
                            std::string_view path,
-                           std::string_view body,
-                           uint64_t token,
-                           uint64_t generation,
-                           bool release,
-                           ControllerHttpResponse* result) {
+                            std::string_view body,
+                            uint64_t token,
+                            uint64_t generation,
+                            ControllerHttpResponse* result) {
   NativeSocket socket_handle = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
   if (socket_handle == kInvalidSocket) {
     env->ThrowError("failed to create Controller socket");
@@ -892,7 +870,6 @@ bool PerformControllerPost(Environment* env,
       .append(std::to_string(GetCurrentThreadId()))
       .append("\r\n");
 #endif
-  if (release) request.append("X-Rex-Realm-Release: 1\r\n");
   request.append("Content-Length: ")
       .append(std::to_string(body.size()))
       .append("\r\n\r\n")
@@ -900,8 +877,7 @@ bool PerformControllerPost(Environment* env,
 
   if (!SendAll(socket_handle, request)) {
     CloseNativeSocket(socket_handle);
-    env->ThrowError(release ? "failed to send the Controller release request"
-                            : "failed to send the parked Controller request");
+    env->ThrowError("failed to send the parked Controller request");
     return false;
   }
 
@@ -921,13 +897,64 @@ bool PerformControllerPost(Environment* env,
       return false;
     }
     response.append(buffer, static_cast<size_t>(received));
+
+    // Once the framed body is present, ParseHttpResponse has everything it
+    // needs; closing locally avoids depending on HTTP connection teardown.
+    const size_t header_end = response.find("\r\n\r\n");
+    if (header_end != std::string::npos) {
+      const std::string_view headers(response.data(), header_end);
+      size_t content_length = std::string::npos;
+      size_t line_start = 0;
+      while (line_start < headers.size()) {
+        const size_t line_end = headers.find("\r\n", line_start);
+        const size_t end = line_end == std::string::npos ? headers.size()
+                                                           : line_end;
+        const std::string_view line = headers.substr(line_start, end - line_start);
+        const size_t colon = line.find(':');
+        if (colon != std::string::npos) {
+          std::string name(line.substr(0, colon));
+          std::transform(name.begin(), name.end(), name.begin(),
+                         [](unsigned char c) {
+                           return static_cast<char>(std::tolower(c));
+                         });
+          if (name == "content-length") {
+            std::string value(line.substr(colon + 1));
+            size_t first = 0;
+            while (first < value.size() &&
+                   std::isspace(static_cast<unsigned char>(value[first]))) {
+              ++first;
+            }
+            size_t last = value.size();
+            while (last > first &&
+                   std::isspace(static_cast<unsigned char>(value[last - 1]))) {
+              --last;
+            }
+            value = value.substr(first, last - first);
+            char* end_ptr = nullptr;
+            errno = 0;
+            const unsigned long long parsed =
+                std::strtoull(value.c_str(), &end_ptr, 10);
+            if (errno == 0 && end_ptr != value.c_str() && *end_ptr == '\0' &&
+                parsed <= kMaxControllerResponseBytes) {
+              content_length = static_cast<size_t>(parsed);
+            }
+            break;
+          }
+        }
+        if (line_end == std::string::npos) break;
+        line_start = line_end + 2;
+      }
+      if (content_length != std::string::npos &&
+          response.size() >= header_end + 4 + content_length) {
+        break;
+      }
+    }
   }
   CloseNativeSocket(socket_handle);
 
   if (!ParseHttpResponse(response,
                          &result->status_code,
-                         &result->body,
-                         &result->hard_suspended)) {
+                         &result->body)) {
     env->ThrowError("Controller returned an invalid HTTP response");
     return false;
   }
@@ -1113,10 +1140,6 @@ bool ReturnTransactionResult(Environment* env,
       env->ThrowError(
           "external call must be parked before it can be committed");
       break;
-    case Result::kNotCompleted:
-      env->ThrowError(
-          "external call must be committed or aborted before release");
-      break;
   }
   return false;
 }
@@ -1223,13 +1246,7 @@ void RequestExternalCallBinding(const FunctionCallbackInfo<Value>& args) {
                              body,
                              token,
                              TokenGeneration(token),
-                             false,
                              &response)) {
-    return;
-  }
-  if (response.hard_suspended &&
-      !ReturnTransactionResult(
-          env, controller->RequireReleaseExternalCall(token))) {
     return;
   }
 
@@ -1252,60 +1269,6 @@ void RequestExternalCallBinding(const FunctionCallbackInfo<Value>& args) {
   result->Set(context, OneByteString(isolate, "body"), response_body_value)
       .Check();
   args.GetReturnValue().Set(result);
-}
-
-void ReleaseExternalCallBinding(const FunctionCallbackInfo<Value>& args) {
-  Environment* env = Environment::GetCurrent(args);
-  RealmTimeController* controller = ResolveController(args);
-  if (controller == nullptr) return;
-  if (args.Length() < 3) {
-    env->ThrowTypeError(
-        "releaseExternalCall requires context, token, and port");
-    return;
-  }
-
-  uint64_t token;
-  if (!ReadToken(env, args[1], &token)) return;
-  const uint64_t generation = TokenGeneration(token);
-  if (generation != controller->generation()) {
-    env->ThrowError("external call token belongs to a stale generation");
-    return;
-  }
-  if (!ReturnTransactionResult(
-          env, controller->ValidateReleaseExternalCall(token))) {
-    return;
-  }
-  uint32_t port;
-  if (!ReadControllerPort(env, args[2], &port)) return;
-
-  std::string path = "/api/realm-release";
-  if (args.Length() >= 4 && !args[3]->IsUndefined()) {
-    if (!ReadControllerPath(env, args[3], &path)) return;
-  }
-
-  ControllerHttpResponse response;
-  if (!PerformControllerPost(
-          env, port, path, "{}", token, generation, true, &response)) {
-    return;
-  }
-  if (response.status_code < 200 || response.status_code >= 300) {
-    std::string message = "Controller release returned HTTP status " +
-                          std::to_string(response.status_code);
-    if (!response.body.empty()) {
-      message.append(": ").append(response.body.substr(0, 512));
-    }
-    env->ThrowError(message.c_str());
-    return;
-  }
-  if (!ReturnTransactionResult(
-          env,
-          controller->FinalizeReleaseExternalCall(
-              token,
-              RealWallTimeMilliseconds(env),
-              RealMonotonicTimeNanoseconds()))) {
-    return;
-  }
-  args.GetReturnValue().Set(true);
 }
 
 void CommitExternalCallBinding(const FunctionCallbackInfo<Value>& args) {
@@ -1381,8 +1344,6 @@ void GetStateBinding(const FunctionCallbackInfo<Value>& args) {
   set("generation",
       Number::New(isolate, static_cast<double>(controller->generation())));
   const char* phase = !controller->enabled()  ? "disabled"
-                      : controller->release_pending()
-                          ? "release-pending"
                       : !controller->frozen() ? "running"
                       : controller->parked()  ? "parked"
                                               : "freezing";
@@ -1425,7 +1386,6 @@ void Initialize(Local<Object> target,
   SetMethod(context, target, "beginExternalCall", BeginExternalCallBinding);
   SetMethod(context, target, "parkExternalCall", ParkExternalCallBinding);
   SetMethod(context, target, "requestExternalCall", RequestExternalCallBinding);
-  SetMethod(context, target, "releaseExternalCall", ReleaseExternalCallBinding);
   SetMethod(context, target, "commitExternalCall", CommitExternalCallBinding);
   SetMethod(context, target, "abortExternalCall", AbortExternalCallBinding);
   SetMethod(context, target, "getState", GetStateBinding);
@@ -1890,7 +1850,6 @@ bool RealmTimeController::Enable(double real_wall_time_ms,
   frozen_monotonic_time_ns_ = real_monotonic_time_ns;
   frames_.clear();
   completed_calls_.clear();
-  pending_release_token_ = kInvalidToken;
   return true;
 }
 
@@ -1907,7 +1866,6 @@ void RealmTimeController::Disable() {
   frozen_monotonic_time_ns_ = 0;
   frames_.clear();
   completed_calls_.clear();
-  pending_release_token_ = kInvalidToken;
 }
 
 uint64_t RealmTimeController::NextToken() {
@@ -1917,9 +1875,8 @@ uint64_t RealmTimeController::NextToken() {
 
 uint64_t RealmTimeController::BeginExternalCall(double real_wall_time_ms,
                                                 uint64_t real_monotonic_time_ns,
-                                                std::string operation) {
+  std::string operation) {
   if (!enabled_) return kInvalidToken;
-  if (pending_release_token_ != kInvalidToken) return kInvalidToken;
   if (frames_.empty()) {
     frozen_wall_time_ms_ = CurrentWallTimeMilliseconds(real_wall_time_ms);
     frozen_monotonic_time_ns_ =
@@ -1947,7 +1904,7 @@ uint64_t RealmTimeController::BeginExternalCall(double real_wall_time_ms,
     }
     return kInvalidToken;
   }
-  frames_.push_back({token, std::move(operation), false, false, false, 0});
+  frames_.push_back({token, std::move(operation), false, 0});
   return token;
 }
 
@@ -1961,20 +1918,6 @@ RealmTimeController::TransactionResult RealmTimeController::ParkExternalCall(
   if (frames_.back().token != token) return TransactionResult::kOutOfOrder;
   if (frames_.back().parked) return TransactionResult::kIdempotent;
   frames_.back().parked = true;
-  return TransactionResult::kOk;
-}
-
-RealmTimeController::TransactionResult
-RealmTimeController::RequireReleaseExternalCall(uint64_t token) {
-  if (!enabled_) return TransactionResult::kNotEnabled;
-  if (!TokenHasCurrentGeneration(token)) {
-    return TransactionResult::kStaleGeneration;
-  }
-  if (frames_.empty()) return TransactionResult::kNoActiveCall;
-  if (frames_.back().token != token) return TransactionResult::kOutOfOrder;
-  if (!frames_.back().parked) return TransactionResult::kNotParked;
-  if (frames_.back().release_required) return TransactionResult::kIdempotent;
-  frames_.back().release_required = true;
   return TransactionResult::kOk;
 }
 
@@ -2027,43 +1970,25 @@ RealmTimeController::TransactionResult RealmTimeController::CommitExternalCall(
     return TransactionResult::kOk;
   }
 
-  const bool release_required = frames_.back().release_required;
-  const bool transport_released = frames_.back().transport_released;
-  if (release_required && !transport_released) {
-    // Compatibility path for callers that commit before sending the
-    // Controller release acknowledgement.  Apply the target duration while
-    // keeping the process clock frozen; FinalizeReleaseExternalCall will only
-    // unfreeze it after the Controller has resumed the process.
-    if (!AdvanceFrozen(committed_duration_ms)) {
-      return TransactionResult::kClockOverflow;
-    }
-    pending_release_token_ = token;
-  } else if (transport_released || !release_required) {
-    // The Controller transport is already over (or no hard suspension was
-    // requested).  This is the target function-execution phase: wait on the
-    // native stack without allowing the target event loop to re-enter, then
-    // atomically project functionDurationMs + timelineAdjustmentMs and
-    // return to JavaScript.
-    WaitFunctionDuration(function_duration_ms);
-    // The binding captures its arguments before entering this method.  The
-    // wait above therefore makes those timestamps stale; use the elapsed
-    // monotonic interval to reconstruct the current wall timestamp before
-    // calculating the running-clock offset.  Otherwise real wait time would
-    // be counted a second time after the logical duration.
-    const uint64_t resume_real_monotonic_time_ns = uv_hrtime();
-    const double elapsed_real_ms =
-        resume_real_monotonic_time_ns >= real_monotonic_time_ns
-            ? static_cast<double>(resume_real_monotonic_time_ns -
-                                  real_monotonic_time_ns) /
-                  kNanosecondsPerMillisecond
-            : 0;
-    const double resume_real_wall_time_ms =
-        real_wall_time_ms + elapsed_real_ms;
-    if (!Resume(committed_duration_ms,
-                resume_real_wall_time_ms,
-                resume_real_monotonic_time_ns)) {
-      return TransactionResult::kClockOverflow;
-    }
+  // Go has already ended the OS suspension before returning the response.
+  // Simulate the browser function stage on this native stack, then atomically
+  // project its logical duration without allowing target event-loop re-entry.
+  WaitFunctionDuration(function_duration_ms);
+  // The binding captures its arguments before entering this method.  The wait
+  // makes those timestamps stale; reconstruct the current wall timestamp so
+  // real wait time is not counted a second time after the logical duration.
+  const uint64_t resume_real_monotonic_time_ns = uv_hrtime();
+  const double elapsed_real_ms =
+      resume_real_monotonic_time_ns >= real_monotonic_time_ns
+          ? static_cast<double>(resume_real_monotonic_time_ns -
+                                real_monotonic_time_ns) /
+                kNanosecondsPerMillisecond
+          : 0;
+  const double resume_real_wall_time_ms = real_wall_time_ms + elapsed_real_ms;
+  if (!Resume(committed_duration_ms,
+              resume_real_wall_time_ms,
+              resume_real_monotonic_time_ns)) {
+    return TransactionResult::kClockOverflow;
   }
 
   frames_.pop_back();
@@ -2082,71 +2007,12 @@ RealmTimeController::TransactionResult RealmTimeController::AbortExternalCall(
   if (frames_.empty()) return TransactionResult::kNoActiveCall;
   if (frames_.back().token != token) return TransactionResult::kOutOfOrder;
   if (frames_.size() == 1) {
-    if (frames_.back().release_required &&
-        !frames_.back().transport_released) {
-      pending_release_token_ = token;
-    } else if (frames_.back().transport_released) {
-      if (!ResumeCommitted(real_wall_time_ms, real_monotonic_time_ns)) {
-        return TransactionResult::kClockOverflow;
-      }
-    } else if (!Resume(0, real_wall_time_ms, real_monotonic_time_ns)) {
+    if (!Resume(0, real_wall_time_ms, real_monotonic_time_ns)) {
       return TransactionResult::kClockOverflow;
     }
   }
   frames_.pop_back();
   RememberCompletion(token, false, 0, 0);
-  return TransactionResult::kOk;
-}
-
-RealmTimeController::TransactionResult
-RealmTimeController::ValidateReleaseExternalCall(uint64_t token) const {
-  if (!enabled_) return TransactionResult::kNotEnabled;
-  if (!TokenHasCurrentGeneration(token)) {
-    return TransactionResult::kStaleGeneration;
-  }
-  for (auto it = frames_.rbegin(); it != frames_.rend(); ++it) {
-    if (it->token == token) {
-      if (it != frames_.rbegin()) return TransactionResult::kOutOfOrder;
-      if (!it->parked) return TransactionResult::kNotParked;
-      if (!it->release_required) return TransactionResult::kNotCompleted;
-      return TransactionResult::kOk;
-    }
-  }
-  for (auto it = completed_calls_.rbegin(); it != completed_calls_.rend();
-       ++it) {
-    if (it->token == token) return TransactionResult::kOk;
-  }
-  return TransactionResult::kNoActiveCall;
-}
-
-RealmTimeController::TransactionResult
-RealmTimeController::FinalizeReleaseExternalCall(
-    uint64_t token,
-    double real_wall_time_ms,
-    uint64_t real_monotonic_time_ns) {
-  if (!enabled_) return TransactionResult::kNotEnabled;
-  if (!TokenHasCurrentGeneration(token)) {
-    return TransactionResult::kStaleGeneration;
-  }
-  if (pending_release_token_ == kInvalidToken) {
-    for (auto it = frames_.rbegin(); it != frames_.rend(); ++it) {
-      if (it->token != token) continue;
-      if (it != frames_.rbegin()) return TransactionResult::kOutOfOrder;
-      if (!it->parked) return TransactionResult::kNotParked;
-      if (!it->release_required) return TransactionResult::kNotCompleted;
-      if (it->transport_released) return TransactionResult::kIdempotent;
-      it->transport_released = true;
-      return TransactionResult::kOk;
-    }
-    return ValidateReleaseExternalCall(token) == TransactionResult::kOk
-               ? TransactionResult::kIdempotent
-               : TransactionResult::kNoActiveCall;
-  }
-  if (pending_release_token_ != token) return TransactionResult::kOutOfOrder;
-  if (!ResumeCommitted(real_wall_time_ms, real_monotonic_time_ns)) {
-    return TransactionResult::kClockOverflow;
-  }
-  pending_release_token_ = kInvalidToken;
   return TransactionResult::kOk;
 }
 
@@ -2162,52 +2028,6 @@ bool RealmTimeController::Resume(double committed_duration_ms,
   if (!std::isfinite(wall_time_offset_ms) ||
       !std::isfinite(monotonic_time_offset_ns) ||
       uv_realm_time_resume(event_loop_, this, committed_duration_ms) != 0) {
-    return false;
-  }
-  if (!ResumeProcessClock(
-          this, wall_time_offset_ms, monotonic_time_offset_ns)) {
-    return false;
-  }
-  wall_time_offset_ms_ = wall_time_offset_ms;
-  monotonic_time_offset_ns_ = monotonic_time_offset_ns;
-  return true;
-}
-
-bool RealmTimeController::AdvanceFrozen(double committed_duration_ms) {
-  if (!std::isfinite(committed_duration_ms) || committed_duration_ms < 0) {
-    return false;
-  }
-  const double frozen_wall_time_ms =
-      frozen_wall_time_ms_ + committed_duration_ms;
-  const double frozen_monotonic_time_ns =
-      frozen_monotonic_time_ns_ +
-      committed_duration_ms * kNanosecondsPerMillisecond;
-  if (!std::isfinite(frozen_wall_time_ms) ||
-      !std::isfinite(frozen_monotonic_time_ns)) {
-    return false;
-  }
-  if (uv_realm_time_advance_frozen(
-          event_loop_, this, committed_duration_ms) != 0) {
-    return false;
-  }
-  if (!AdvanceFrozenProcessClock(
-          this, frozen_wall_time_ms, frozen_monotonic_time_ns)) {
-    return false;
-  }
-  frozen_wall_time_ms_ = frozen_wall_time_ms;
-  frozen_monotonic_time_ns_ = frozen_monotonic_time_ns;
-  return true;
-}
-
-bool RealmTimeController::ResumeCommitted(double real_wall_time_ms,
-                                          uint64_t real_monotonic_time_ns) {
-  const double wall_time_offset_ms =
-      frozen_wall_time_ms_ - real_wall_time_ms;
-  const double monotonic_time_offset_ns =
-      frozen_monotonic_time_ns_ - static_cast<double>(real_monotonic_time_ns);
-  if (!std::isfinite(wall_time_offset_ms) ||
-      !std::isfinite(monotonic_time_offset_ns) ||
-      uv_realm_time_resume(event_loop_, this, 0) != 0) {
     return false;
   }
   if (!ResumeProcessClock(
@@ -2285,10 +2105,7 @@ bool RealmTimeController::TokenHasCurrentGeneration(uint64_t token) const {
 
 const std::string& RealmTimeController::active_operation() const {
   static const std::string empty;
-  static const std::string release = "release";
-  return frames_.empty()
-             ? (pending_release_token_ == kInvalidToken ? empty : release)
-             : frames_.back().operation;
+  return frames_.empty() ? empty : frames_.back().operation;
 }
 
 double RealmTimeController::CurrentWallTimeMilliseconds(
@@ -2358,7 +2175,6 @@ void RegisterExternalReferences(ExternalReferenceRegistry* registry) {
   registry->Register(BeginExternalCallBinding);
   registry->Register(ParkExternalCallBinding);
   registry->Register(RequestExternalCallBinding);
-  registry->Register(ReleaseExternalCallBinding);
   registry->Register(CommitExternalCallBinding);
   registry->Register(AbortExternalCallBinding);
   registry->Register(GetStateBinding);

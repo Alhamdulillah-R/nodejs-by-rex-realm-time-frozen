@@ -9,7 +9,7 @@ const realmTime = process._realmTime;
 
 assert.strictEqual(typeof realmTime, 'object');
 assert(Object.isFrozen(realmTime));
-assert.strictEqual(typeof realmTime.releaseExternalCall, 'function');
+assert.strictEqual(realmTime.releaseExternalCall, undefined);
 
 function blockHost(delay) {
   Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, delay);
@@ -66,19 +66,21 @@ function onceLine(stream) {
   // Worker event-loop callback is needed to deliver the response.
   const controller = spawn(process.execPath, ['-e', `
     const http = require('http');
-    let queryHeaders;
-    let releaseCount = 0;
+    let queryCount = 0;
     const server = http.createServer((request, response) => {
       let body = '';
       request.setEncoding('utf8');
       request.on('data', (chunk) => body += chunk);
       request.on('end', () => {
-        if (request.url === '/api/query') {
-          queryHeaders = request.headers;
-          response.setHeader('X-Rex-Realm-Hard-Suspended', '1');
-          const query = JSON.parse(body);
-          const functionDurationMs = query.method === 'phase-order' ? 40 : 4;
-          setTimeout(() => response.end(JSON.stringify({
+        if (request.url !== '/api/query') {
+          response.statusCode = 404;
+          response.end();
+          return;
+        }
+        const query = JSON.parse(body);
+        const functionDurationMs = query.method === 'phase-order' ? 40 : 4;
+        setTimeout(() => {
+          response.end(JSON.stringify({
             parkAck: request.headers['x-rex-realm-park-ack'],
             token: request.headers['x-rex-realm-token'],
             generation: request.headers['x-rex-realm-generation'],
@@ -87,28 +89,9 @@ function onceLine(stream) {
             request: query,
             functionDurationMs,
             timelineAdjustmentMs: 1,
-          })), 40);
-          return;
-        }
-
-        const token = request.headers['x-rex-realm-token'];
-        const expectedGeneration = token === undefined ? '' :
-          String(BigInt(token) >> 24n);
-        const controlTid = request.headers['x-rex-realm-control-tid'];
-        const valid = request.method === 'POST' &&
-          request.headers['x-rex-realm-release'] === '1' &&
-          request.headers['x-rex-realm-park-ack'] === '1' &&
-          request.headers['x-rex-realm-generation'] === expectedGeneration &&
-          request.headers['x-rex-realm-worker-pid'] ===
-            queryHeaders['x-rex-realm-worker-pid'] &&
-          body === '{}' &&
-          (process.platform !== 'win32' ||
-            (Number(controlTid) > 0 &&
-             controlTid === queryHeaders['x-rex-realm-control-tid']));
-        response.statusCode = valid ?
-          (request.url === '/api/realm-release-fail' ? 409 : 204) : 422;
-        response.end();
-        if (++releaseCount === 4) server.close();
+          }));
+          if (++queryCount === 2) server.close();
+        }, 40);
       });
     });
     server.listen(0, '127.0.0.1', () => {
@@ -116,18 +99,6 @@ function onceLine(stream) {
     });
   `], { stdio: ['ignore', 'pipe', 'inherit'] });
   const controllerPort = Number(await onceLine(controller.stdout));
-
-  // The native API itself enforces the two-phase boundary. A caller cannot
-  // resume Controller-suspended threads before the clock reaches a terminal
-  // commit/abort state, even if framework JS is accidentally reordered.
-  const prematureReleaseToken = realmTime.beginExternalCall(
-    null, 'cdp.query.premature-release');
-  realmTime.parkExternalCall(null, prematureReleaseToken);
-  assert.throws(
-    () => realmTime.releaseExternalCall(
-      null, prematureReleaseToken, controllerPort),
-    /committed or aborted before release/);
-  realmTime.abortExternalCall(null, prematureReleaseToken);
 
   const requestToken = realmTime.beginExternalCall(null, 'cdp.query');
   const requestFrozen = performance.now();
@@ -138,6 +109,8 @@ function onceLine(stream) {
     '/api/query',
     JSON.stringify({ method: 'Runtime.evaluate' }));
   assert.strictEqual(nativeResponse.statusCode, 200);
+  assert.strictEqual(nativeResponse.hardSuspended, undefined);
+  assert.strictEqual(nativeResponse.transportReleased, undefined);
   assert.strictEqual(performance.now(), requestFrozen);
   const envelope = JSON.parse(nativeResponse.body);
   assert.strictEqual(envelope.parkAck, '1');
@@ -157,14 +130,11 @@ function onceLine(stream) {
   // The V8 performance clock is fractional; the committed 4ms function plus
   // 1ms timeline adjustment may round just below 5.0 at the read boundary.
   assert(performance.now() - requestFrozen >= 4.5);
-  assert.strictEqual(
-    realmTime.releaseExternalCall(null, requestToken, controllerPort), true);
 
-  // Future semantics: Controller transport release is the boundary between
-  // the frozen CDP/Go phase and the synchronous browser-function phase.
-  // Release first resumes the process with the logical clock still frozen;
-  // commit then paces functionDurationMs on the native stack and only after
-  // that returns the target scheduler to JavaScript.
+  // Go resumes the OS-suspended transport threads before returning this native
+  // request. The logical clock remains frozen; commit then paces
+  // functionDurationMs on the native stack and only afterward returns the
+  // target scheduler to JavaScript.
   const phaseToken = realmTime.beginExternalCall(null, 'cdp.query.phase-order');
   const phaseFrozen = performance.now();
   const phaseStarted = process.hrtime.bigint();
@@ -175,21 +145,28 @@ function onceLine(stream) {
     '/api/query',
     JSON.stringify({ method: 'phase-order' }),
   );
-  assert.strictEqual(realmTime.releaseExternalCall(
-    null, phaseToken, controllerPort), true);
+  assert.strictEqual(phaseResponse.hardSuspended, undefined);
+  assert.strictEqual(phaseResponse.transportReleased, undefined);
   assert.strictEqual(performance.now(), phaseFrozen);
   const phaseEvents = [];
   queueMicrotask(() => phaseEvents.push('microtask'));
   setTimeout(() => phaseEvents.push('timer'), 0);
+  const apiBlockStarted = process.hrtime.bigint();
   realmTime.commitExternalCall(
     null,
     phaseToken,
     JSON.parse(phaseResponse.body).functionDurationMs,
     JSON.parse(phaseResponse.body).timelineAdjustmentMs,
   );
+  const apiBlockElapsedMs =
+    Number(process.hrtime.bigint() - apiBlockStarted) / 1e6;
   // The synchronous function-duration phase runs on the native call stack;
   // neither a microtask nor a timer may interleave before commit returns.
   assert.deepStrictEqual(phaseEvents, []);
+  assert(apiBlockElapsedMs >= 39,
+         `API returned before its in-place native wait: ${apiBlockElapsedMs}ms`);
+  assert(apiBlockElapsedMs < 250,
+         `API in-place native wait was unexpectedly long: ${apiBlockElapsedMs}ms`);
   const phaseElapsedMs =
     Number(process.hrtime.bigint() - phaseStarted) / 1e6;
   assert(phaseElapsedMs >= 35,
@@ -199,21 +176,6 @@ function onceLine(stream) {
   await Promise.resolve();
   assert.deepStrictEqual(phaseEvents, ['microtask']);
 
-  // Release is a second-phase Controller acknowledgement. It remains valid
-  // after either terminal outcome and derives generation from the token.
-  const abortedRequestToken = realmTime.beginExternalCall(
-    null, 'cdp.query.abort');
-  realmTime.abortExternalCall(null, abortedRequestToken);
-  assert.strictEqual(
-    realmTime.releaseExternalCall(null, abortedRequestToken, controllerPort),
-    true);
-  assert.throws(
-    () => realmTime.releaseExternalCall(
-      null,
-      abortedRequestToken,
-      controllerPort,
-      '/api/realm-release-fail'),
-    /HTTP status 409/);
   await new Promise((resolve) => controller.once('exit', resolve));
 
   // libuv timer deadlines use the logical loop clock. A real 60 ms park with

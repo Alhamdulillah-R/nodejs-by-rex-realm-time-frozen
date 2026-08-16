@@ -324,13 +324,6 @@ UV_EXTERN int uv_realm_time_freeze(uv_loop_t* loop, const void* owner);
 UV_EXTERN int uv_realm_time_resume(uv_loop_t* loop,
                                     const void* owner,
                                     double advance_ms);
-/* Advance the logical clock while the loop remains frozen.  This is used
- * between the Controller transport release and the synchronous target
- * function commit: other threads may have resumed, but target scheduling
- * must remain parked until the native call returns. */
-UV_EXTERN int uv_realm_time_advance_frozen(uv_loop_t* loop,
-                                           const void* owner,
-                                           double advance_ms);
 UV_EXTERN int uv_realm_time_is_frozen(const uv_loop_t* loop);
 
 UV_EXTERN int uv_backend_fd(const uv_loop_t*);
