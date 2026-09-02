@@ -139,11 +139,24 @@ v8::Local<v8::Value> InterceptUncaughtException(Environment* env,
 double CurrentWallTimeMilliseconds(double real_wall_time_ms);
 double CurrentMonotonicTimeNanoseconds(uint64_t real_monotonic_time_ns);
 
-// Chromium-shaped observable clock surface, opt-in through the environment:
+// Chromium-shaped observable clock surface.  Seeded from the environment and
+// changeable at runtime through globalThis.RexMirror.clock (see
+// lib/internal/bootstrap/node.js):
 //   REX_CLOCK_RESOLUTION_NS  quantum applied to performance.now() and every
 //                            DOMHighResTimeStamp derived from it.  Unset or 0
 //                            keeps the raw hrtime; 100000 reproduces a
 //                            non-isolated Blink renderer (100us).
+struct ClockSurfaceSettings {
+  int64_t resolution_ns;
+  bool nesting_clamp;
+  double timer_grid_ms;
+};
+ClockSurfaceSettings GetClockSurfaceSettings();
+// Applies every field; on a rejected value nothing changes and *error names
+// the offending field.
+bool SetClockSurfaceSettings(const ClockSurfaceSettings& settings,
+                             std::string* error);
+
 // Port of Blink TimeClamper (time_clamper.cc): floor to the quantum, then
 // step one quantum up once the raw value crosses a per-process keyed
 // pseudo-random threshold, so the emitted distribution matches a renderer

@@ -103,7 +103,50 @@ const off = {
   assert.ok(r.p50 > 12 && r.p50 < 20, `p50=${r.p50}`);
 }
 
-// 5. Invalid values fail loudly instead of being ignored.
+// 5. RexMirror.clock: non-enumerable global; presets switch the surface at
+//    runtime; bad values throw.
+{
+  const r = runChild(off, `
+    const desc = Object.getOwnPropertyDescriptor(globalThis, 'RexMirror');
+    const before = RexMirror.clock.get();
+    const chrome = RexMirror.clock.use('chrome');
+    const t = setTimeout(() => {}, 0);
+    const idle = t._idleTimeout;
+    clearTimeout(t);
+    const v = Array.from({ length: 5000 }, () => performance.now());
+    const onGrid = (x) => Math.abs(x * 10 - Math.round(x * 10)) < 1e-6;
+    let bad = null;
+    try { RexMirror.clock.set({ resolutionNs: -1 }); } catch (e) { bad = e.name; }
+    let badName = null;
+    try { RexMirror.clock.use('nope'); } catch (e) { badName = e.code; }
+    console.log(JSON.stringify({
+      enumerable: desc.enumerable,
+      writable: desc.writable,
+      inKeys: Object.keys(globalThis).includes('RexMirror'),
+      before, chrome, idle,
+      offGrid: v.filter((x) => !onGrid(x)).length,
+      distinct: new Set(v).size,
+      bad, badName,
+      after: RexMirror.clock.set({ timerGridMs: 15.625 }),
+    }));
+  `);
+  assert.strictEqual(r.enumerable, false);
+  assert.strictEqual(r.writable, false);
+  assert.strictEqual(r.inKeys, false);
+  assert.deepStrictEqual(r.before,
+                         { resolutionNs: 0, nestingClamp: false, timerGridMs: 0 });
+  assert.deepStrictEqual(r.chrome,
+                         { resolutionNs: 100000, nestingClamp: true, timerGridMs: 0 });
+  assert.strictEqual(r.idle, 0);
+  assert.strictEqual(r.offGrid, 0);
+  assert.ok(r.distinct < 2500, `distinct=${r.distinct}`);
+  assert.strictEqual(r.bad, 'RangeError');
+  assert.strictEqual(r.badName, 'ERR_INVALID_ARG_VALUE');
+  assert.deepStrictEqual(r.after,
+                         { resolutionNs: 100000, nestingClamp: true, timerGridMs: 15.625 });
+}
+
+// 6. Invalid environment values fail loudly instead of being ignored.
 {
   const result = spawnSync(process.execPath, ['-e', '0'], {
     env: { ...process.env, ...off, REX_TIMER_NESTING_CLAMP: 'yes' },

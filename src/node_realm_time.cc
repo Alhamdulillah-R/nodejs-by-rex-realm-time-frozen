@@ -695,9 +695,43 @@ uint64_t RandomClockSecret() {
          static_cast<uint64_t>(device());
 }
 
-const ClockSurfaceConfig& GetClockSurfaceConfig() {
-  static const ClockSurfaceConfig config = [] {
-    ClockSurfaceConfig result{0, RandomClockSecret(), false};
+// Process-wide, mutable after startup (RexMirror.clock.set).  The secret is
+// fixed for the life of the process like a renderer's TimeClamper.
+struct ClockSurfaceState {
+  std::atomic<int64_t> resolution_ns{0};
+  std::atomic<bool> nesting_clamp{false};
+  uint64_t secret = 0;
+};
+
+ClockSurfaceConfig ParseClockSurfaceEnvironment(uint64_t secret);
+
+ClockSurfaceState& ClockSurface() {
+  static ClockSurfaceState state;
+  static std::once_flag once;
+  std::call_once(once, [] {
+    const ClockSurfaceConfig initial =
+        ParseClockSurfaceEnvironment(RandomClockSecret());
+    state.secret = initial.secret;
+    state.resolution_ns.store(initial.resolution_ns,
+                              std::memory_order_relaxed);
+    state.nesting_clamp.store(initial.nesting_clamp,
+                              std::memory_order_relaxed);
+  });
+  return state;
+}
+
+// Snapshot for the hot paths; the atomics make it consistent enough per read.
+ClockSurfaceConfig GetClockSurfaceConfig() {
+  ClockSurfaceState& state = ClockSurface();
+  return ClockSurfaceConfig{
+      state.resolution_ns.load(std::memory_order_relaxed),
+      state.secret,
+      state.nesting_clamp.load(std::memory_order_relaxed)};
+}
+
+ClockSurfaceConfig ParseClockSurfaceEnvironment(uint64_t secret) {
+  {
+    ClockSurfaceConfig result{0, secret, false};
     std::string raw;
     if (credentials::SafeGetenv("REX_CLOCK_RESOLUTION_NS", &raw) &&
         !raw.empty()) {
@@ -726,8 +760,7 @@ const ClockSurfaceConfig& GetClockSurfaceConfig() {
       result.nesting_clamp = true;
     }
     return result;
-  }();
-  return config;
+  }
 }
 
 uint64_t MurmurHash3Finalize(uint64_t value) {
@@ -1435,6 +1468,107 @@ void AbortExternalCallBinding(const FunctionCallbackInfo<Value>& args) {
   args.GetReturnValue().Set(true);
 }
 
+Local<Object> ClockSurfaceToObject(Environment* env,
+                                   const ClockSurfaceSettings& settings) {
+  Isolate* isolate = env->isolate();
+  Local<Context> context = isolate->GetCurrentContext();
+  Local<Object> result = Object::New(isolate);
+  result
+      ->Set(context,
+            OneByteString(isolate, "resolutionNs"),
+            Number::New(isolate, static_cast<double>(settings.resolution_ns)))
+      .Check();
+  result
+      ->Set(context,
+            OneByteString(isolate, "nestingClamp"),
+            Boolean::New(isolate, settings.nesting_clamp))
+      .Check();
+  result
+      ->Set(context,
+            OneByteString(isolate, "timerGridMs"),
+            Number::New(isolate, settings.timer_grid_ms))
+      .Check();
+  return result;
+}
+
+void GetClockSurfaceBinding(const FunctionCallbackInfo<Value>& args) {
+  Environment* env = Environment::GetCurrent(args);
+  args.GetReturnValue().Set(
+      ClockSurfaceToObject(env, GetClockSurfaceSettings()));
+}
+
+// setClockSurface({ resolutionNs?, nestingClamp?, timerGridMs? }): fields
+// left undefined keep their current value; anything else is validated here
+// so a bad call throws instead of silently doing nothing.
+void SetClockSurfaceBinding(const FunctionCallbackInfo<Value>& args) {
+  Environment* env = Environment::GetCurrent(args);
+  Isolate* isolate = env->isolate();
+  Local<Context> context = isolate->GetCurrentContext();
+  if (args.Length() < 1 || !args[0]->IsObject()) {
+    env->ThrowTypeError("setClockSurface requires an options object");
+    return;
+  }
+  Local<Object> options = args[0].As<Object>();
+  ClockSurfaceSettings settings = GetClockSurfaceSettings();
+  Local<Value> value;
+
+  if (!options->Get(context, OneByteString(isolate, "resolutionNs"))
+           .ToLocal(&value)) {
+    return;
+  }
+  if (!value->IsUndefined()) {
+    if (!value->IsNumber()) {
+      env->ThrowTypeError("resolutionNs must be a number");
+      return;
+    }
+    const double nanoseconds = value.As<Number>()->Value();
+    if (!std::isfinite(nanoseconds) || nanoseconds < 0 ||
+        nanoseconds != std::floor(nanoseconds) || nanoseconds > 1e12) {
+      env->ThrowRangeError(
+          "resolutionNs must be a whole number of nanoseconds in 0..1e12");
+      return;
+    }
+    settings.resolution_ns = static_cast<int64_t>(nanoseconds);
+  }
+
+  if (!options->Get(context, OneByteString(isolate, "nestingClamp"))
+           .ToLocal(&value)) {
+    return;
+  }
+  if (!value->IsUndefined()) {
+    if (!value->IsBoolean()) {
+      env->ThrowTypeError("nestingClamp must be a boolean");
+      return;
+    }
+    settings.nesting_clamp = value->IsTrue();
+  }
+
+  if (!options->Get(context, OneByteString(isolate, "timerGridMs"))
+           .ToLocal(&value)) {
+    return;
+  }
+  if (!value->IsUndefined()) {
+    if (!value->IsNumber()) {
+      env->ThrowTypeError("timerGridMs must be a number");
+      return;
+    }
+    const double grid = value.As<Number>()->Value();
+    if (!std::isfinite(grid) || grid < 0) {
+      env->ThrowRangeError("timerGridMs must be finite and non-negative");
+      return;
+    }
+    settings.timer_grid_ms = grid;
+  }
+
+  std::string error;
+  if (!SetClockSurfaceSettings(settings, &error)) {
+    env->ThrowRangeError(error.c_str());
+    return;
+  }
+  args.GetReturnValue().Set(
+      ClockSurfaceToObject(env, GetClockSurfaceSettings()));
+}
+
 void GetStateBinding(const FunctionCallbackInfo<Value>& args) {
   Environment* env = Environment::GetCurrent(args);
   RealmTimeController* controller = ResolveController(args);
@@ -1513,6 +1647,8 @@ void Initialize(Local<Object> target,
             "getCodeGenerationRecords",
             GetCodeGenerationRecordsBinding);
   SetMethod(context, target, "getExceptionRecords", GetExceptionRecordsBinding);
+  SetMethod(context, target, "getClockSurface", GetClockSurfaceBinding);
+  SetMethod(context, target, "setClockSurface", SetClockSurfaceBinding);
 }
 
 }  // namespace
@@ -2263,11 +2399,35 @@ double ObservableElapsedMilliseconds(double now_ns, double origin_ns) {
 }
 
 bool TimerNestingClampEnabled() {
-  return GetClockSurfaceConfig().nesting_clamp;
+  return ClockSurface().nesting_clamp.load(std::memory_order_relaxed);
 }
 
 void InitializeClockSurface() {
-  GetClockSurfaceConfig();
+  ClockSurface();
+}
+
+ClockSurfaceSettings GetClockSurfaceSettings() {
+  const ClockSurfaceConfig config = GetClockSurfaceConfig();
+  return ClockSurfaceSettings{config.resolution_ns,
+                              config.nesting_clamp,
+                              uv_realm_timer_grid_get()};
+}
+
+bool SetClockSurfaceSettings(const ClockSurfaceSettings& settings,
+                             std::string* error) {
+  if (settings.resolution_ns < 0 ||
+      settings.resolution_ns > INT64_C(1000000000000)) {
+    *error = "resolutionNs must be in 0..1e12";
+    return false;
+  }
+  if (uv_realm_timer_grid_set(settings.timer_grid_ms) != 0) {
+    *error = "timerGridMs must be finite and non-negative";
+    return false;
+  }
+  ClockSurfaceState& state = ClockSurface();
+  state.resolution_ns.store(settings.resolution_ns, std::memory_order_relaxed);
+  state.nesting_clamp.store(settings.nesting_clamp, std::memory_order_relaxed);
+  return true;
 }
 
 RealmTimeController* GetController(Local<Context> context) {
@@ -2307,6 +2467,8 @@ void UninstallTimeSourceCallback(Isolate* isolate) {
 
 void RegisterExternalReferences(ExternalReferenceRegistry* registry) {
   registry->Register(EnableBinding);
+  registry->Register(GetClockSurfaceBinding);
+  registry->Register(SetClockSurfaceBinding);
   registry->Register(DisableBinding);
   registry->Register(IsEnabledBinding);
   registry->Register(BeginExternalCallBinding);

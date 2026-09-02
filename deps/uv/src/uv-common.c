@@ -920,9 +920,10 @@ int uv__realm_grid_timeout(int timeout) {
   double boundary_ms;
   double wait_ms;
 
-  uv_once(&uv__realm_time_once, uv__realm_time_init_once);
-  grid = uv__realm_timer_grid_ms;
-  if (grid <= 0 || timeout <= 0)
+  if (timeout <= 0)
+    return timeout;
+  grid = uv_realm_timer_grid_get();
+  if (grid <= 0)
     return timeout;
 
   /* Anchor the grid to the monotonic clock origin so consecutive wakeups ride
@@ -937,6 +938,26 @@ int uv__realm_grid_timeout(int timeout) {
   if (wait_ms > (double) INT_MAX)
     wait_ms = (double) INT_MAX;
   return (int) wait_ms;
+}
+
+
+int uv_realm_timer_grid_set(double grid_ms) {
+  if (!isfinite(grid_ms) || grid_ms < 0)
+    return UV_EINVAL;
+  uv__realm_time_lock();
+  uv__realm_timer_grid_ms = grid_ms;
+  uv_mutex_unlock(&uv__realm_time_mutex);
+  return 0;
+}
+
+
+double uv_realm_timer_grid_get(void) {
+  double grid;
+
+  uv__realm_time_lock();
+  grid = uv__realm_timer_grid_ms;
+  uv_mutex_unlock(&uv__realm_time_mutex);
+  return grid;
 }
 
 

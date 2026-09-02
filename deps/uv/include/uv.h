@@ -325,6 +325,11 @@ UV_EXTERN int uv_realm_time_resume(uv_loop_t* loop,
                                     const void* owner,
                                     double advance_ms);
 UV_EXTERN int uv_realm_time_is_frozen(const uv_loop_t* loop);
+/* Coarse scheduler-tick emulation for poll timeouts (0 = native).  Seeded
+ * from REX_TIMER_GRID_MS, changeable at runtime; takes effect at the next
+ * poll. */
+UV_EXTERN int uv_realm_timer_grid_set(double grid_ms);
+UV_EXTERN double uv_realm_timer_grid_get(void);
 
 UV_EXTERN int uv_backend_fd(const uv_loop_t*);
 UV_EXTERN int uv_backend_timeout(const uv_loop_t*);
