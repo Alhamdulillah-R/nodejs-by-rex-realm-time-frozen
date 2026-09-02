@@ -16,12 +16,15 @@
 #include <cctype>
 #include <cerrno>
 #include <cmath>
+#include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <deque>
 #include <iomanip>
 #include <limits>
 #include <memory>
 #include <mutex>
+#include <random>
 #include <sstream>
 #include <string_view>
 #include <thread>
@@ -675,6 +678,103 @@ ProcessClockSnapshot ReadProcessClock() {
     after = process_clock.sequence.load(std::memory_order_acquire);
   } while (before != after || (after & 1));
   return snapshot;
+}
+
+// Blink TimeClamper port (third_party/blink/renderer/core/timing/
+// time_clamper.cc).  The quantum comes from REX_CLOCK_RESOLUTION_NS, the
+// per-process secret makes bucket thresholds unpredictable across runs.
+struct ClockSurfaceConfig {
+  int64_t resolution_ns;
+  uint64_t secret;
+  bool nesting_clamp;
+};
+
+uint64_t RandomClockSecret() {
+  std::random_device device;
+  return (static_cast<uint64_t>(device()) << 32) ^
+         static_cast<uint64_t>(device());
+}
+
+const ClockSurfaceConfig& GetClockSurfaceConfig() {
+  static const ClockSurfaceConfig config = [] {
+    ClockSurfaceConfig result{0, RandomClockSecret(), false};
+    std::string raw;
+    if (credentials::SafeGetenv("REX_CLOCK_RESOLUTION_NS", &raw) &&
+        !raw.empty()) {
+      char* end = nullptr;
+      const double nanoseconds = std::strtod(raw.c_str(), &end);
+      if (end == raw.c_str() || *end != '\0' ||
+          !std::isfinite(nanoseconds) || nanoseconds < 0 ||
+          nanoseconds != std::floor(nanoseconds) || nanoseconds > 1e12) {
+        fprintf(stderr,
+                "REX_CLOCK_RESOLUTION_NS: invalid value '%s' "
+                "(whole nanoseconds, 0..1e12)\n",
+                raw.c_str());
+        exit(9);
+      }
+      result.resolution_ns = static_cast<int64_t>(nanoseconds);
+    }
+    raw.clear();
+    if (credentials::SafeGetenv("REX_TIMER_NESTING_CLAMP", &raw) &&
+        !raw.empty() && raw != "0") {
+      if (raw != "1") {
+        fprintf(stderr,
+                "REX_TIMER_NESTING_CLAMP: must be 0 or 1, got '%s'\n",
+                raw.c_str());
+        exit(9);
+      }
+      result.nesting_clamp = true;
+    }
+    return result;
+  }();
+  return config;
+}
+
+uint64_t MurmurHash3Finalize(uint64_t value) {
+  value ^= value >> 33;
+  value *= UINT64_C(0xff51afd7ed558ccd);
+  value ^= value >> 33;
+  value *= UINT64_C(0xc4ceb9fe1a85ec53);
+  value ^= value >> 33;
+  return value;
+}
+
+// Uniform [0, 1) from the hash mantissa, same construction as Blink.
+double UnitIntervalFromHash(uint64_t hash) {
+  constexpr uint64_t kExponentBits = UINT64_C(0x3FF0000000000000);
+  constexpr uint64_t kMantissaMask = UINT64_C(0x000FFFFFFFFFFFFF);
+  const uint64_t bits = (hash & kMantissaMask) | kExponentBits;
+  double result;
+  std::memcpy(&result, &bits, sizeof(result));
+  return result - 1.0;
+}
+
+double ClampToRendererQuantum(double milliseconds) {
+  const ClockSurfaceConfig& config = GetClockSurfaceConfig();
+  if (config.resolution_ns <= 0 || !std::isfinite(milliseconds)) {
+    return milliseconds;
+  }
+  const bool negative = milliseconds < 0;
+  // Work on integer nanoseconds.  The input is an exact nanosecond count that
+  // was divided by 1e6, so rounding recovers it and keeps the bucket math
+  // exact; the final /1e6 then yields the same doubles a renderer gets from
+  // microseconds/1000 (e.g. 419744.8999999985) and a stock Windows Node gets
+  // from QPC nanoseconds/1e6 (e.g. 108.9432).
+  const double raw_ns_d = std::fabs(milliseconds) * 1e6;
+  // Beyond int64 range there is nothing meaningful to quantize.
+  if (raw_ns_d >= 9.0e18) return milliseconds;
+  const int64_t raw_ns = std::llround(raw_ns_d);
+  int64_t bucket_ns = raw_ns - raw_ns % config.resolution_ns;
+  const uint64_t hash =
+      MurmurHash3Finalize(static_cast<uint64_t>(bucket_ns) ^ config.secret);
+  const double threshold_ns =
+      static_cast<double>(bucket_ns) +
+      static_cast<double>(config.resolution_ns) * UnitIntervalFromHash(hash);
+  if (static_cast<double>(raw_ns) >= threshold_ns) {
+    bucket_ns += config.resolution_ns;
+  }
+  const double result = static_cast<double>(bucket_ns) / 1e6;
+  return negative ? -result : result;
 }
 
 #ifdef _WIN32
@@ -2131,6 +2231,18 @@ double CurrentMonotonicTimeNanoseconds(uint64_t real_monotonic_time_ns) {
   if (snapshot.frozen) return snapshot.frozen_monotonic_time_ns;
   return static_cast<double>(real_monotonic_time_ns) +
          snapshot.monotonic_time_offset_ns;
+}
+
+double ClampObservableMilliseconds(double milliseconds) {
+  return ClampToRendererQuantum(milliseconds);
+}
+
+bool TimerNestingClampEnabled() {
+  return GetClockSurfaceConfig().nesting_clamp;
+}
+
+void InitializeClockSurface() {
+  GetClockSurfaceConfig();
 }
 
 RealmTimeController* GetController(Local<Context> context) {

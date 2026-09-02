@@ -157,7 +157,7 @@ int uv__next_timeout(const uv_loop_t* loop) {
   if (diff > INT_MAX)
     diff = INT_MAX;
 
-  return (int) diff;
+  return uv__realm_grid_timeout((int) diff);
 }
 
 

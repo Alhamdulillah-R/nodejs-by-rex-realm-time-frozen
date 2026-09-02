@@ -3,6 +3,7 @@
 #include "env-inl.h"
 #include "node_debug.h"
 #include "node_external_reference.h"
+#include "node_realm_time.h"
 #include "util-inl.h"
 #include "v8.h"
 
@@ -130,11 +131,18 @@ v8::CFunction BindingData::fast_toggle_timer_ref_(
 v8::CFunction BindingData::fast_toggle_immediate_ref_(
     v8::CFunction::Make(FastToggleImmediateRef));
 
+void BindingData::NestingClampEnabled(
+    const FunctionCallbackInfo<Value>& args) {
+  args.GetReturnValue().Set(realm_time::TimerNestingClampEnabled());
+}
+
 void BindingData::CreatePerIsolateProperties(IsolateData* isolate_data,
                                              Local<ObjectTemplate> target) {
   Isolate* isolate = isolate_data->isolate();
 
   SetMethod(isolate, target, "setupTimers", SetupTimers);
+  SetMethodNoSideEffect(
+      isolate, target, "nestingClampEnabled", NestingClampEnabled);
   SetFastMethod(
       isolate, target, "getLibuvNow", SlowGetLibuvNow, &fast_get_libuv_now_);
   SetFastMethod(isolate,
@@ -180,6 +188,7 @@ void BindingData::CreatePerContextProperties(Local<Object> target,
 void BindingData::RegisterTimerExternalReferences(
     ExternalReferenceRegistry* registry) {
   registry->Register(SetupTimers);
+  registry->Register(NestingClampEnabled);
 
   registry->Register(SlowGetLibuvNow);
   registry->Register(fast_get_libuv_now_);

@@ -24,6 +24,11 @@ class BindingData : public SnapshotableObject {
   SET_MEMORY_INFO_NAME(BindingData)
 
   static void SetupTimers(const v8::FunctionCallbackInfo<v8::Value>& args);
+  // Exposed as a method rather than a property: lib/internal/timers.js lives
+  // in the startup snapshot, so a value captured at snapshot build time would
+  // never see the runtime environment.
+  static void NestingClampEnabled(
+      const v8::FunctionCallbackInfo<v8::Value>& args);
 
   static void SlowGetLibuvNow(const v8::FunctionCallbackInfo<v8::Value>& args);
   static double FastGetLibuvNow(v8::Local<v8::Value> receiver);

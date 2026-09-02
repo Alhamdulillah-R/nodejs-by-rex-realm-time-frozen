@@ -46,6 +46,7 @@
 #include "node_snapshot_builder.h"
 #include "node_v8_platform-inl.h"
 #include "node_version.h"
+#include "node_realm_time.h"
 
 #if HAVE_OPENSSL
 #include "ncrypto.h"
@@ -1113,6 +1114,10 @@ InitializeOncePerProcessInternal(const std::vector<std::string>& args,
   }
 
   PlatformInit(flags);
+
+  // Fail fast on a malformed clock-surface environment (REX_CLOCK_* /
+  // REX_TIMER_*) instead of at the first performance.now() or timer.
+  realm_time::InitializeClockSurface();
 
   // This needs to run *before* V8::Initialize().
   {

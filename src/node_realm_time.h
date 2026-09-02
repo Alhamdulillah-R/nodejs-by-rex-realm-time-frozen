@@ -139,6 +139,24 @@ v8::Local<v8::Value> InterceptUncaughtException(Environment* env,
 double CurrentWallTimeMilliseconds(double real_wall_time_ms);
 double CurrentMonotonicTimeNanoseconds(uint64_t real_monotonic_time_ns);
 
+// Chromium-shaped observable clock surface, opt-in through the environment:
+//   REX_CLOCK_RESOLUTION_NS  quantum applied to performance.now() and every
+//                            DOMHighResTimeStamp derived from it.  Unset or 0
+//                            keeps the raw hrtime; 100000 reproduces a
+//                            non-isolated Blink renderer (100us).
+// Port of Blink TimeClamper: floor to the quantum, then step one quantum up
+// once the raw value crosses a per-process keyed pseudo-random threshold, so
+// the emitted distribution matches a renderer rather than a bare floor().
+double ClampObservableMilliseconds(double milliseconds);
+
+//   REX_TIMER_NESTING_CLAMP=1 Blink DOMTimer nesting semantics in
+//                            lib/internal/timers.js (queried via timers.cc).
+bool TimerNestingClampEnabled();
+
+// Parses and validates the clock-surface environment once per process so a
+// malformed value fails at startup rather than at the first clock read.
+void InitializeClockSurface();
+
 void InstallTimeSourceCallback(v8::Isolate* isolate);
 void UninstallTimeSourceCallback(v8::Isolate* isolate);
 void RegisterExternalReferences(ExternalReferenceRegistry* registry);

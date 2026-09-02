@@ -56,6 +56,7 @@ extern int snprintf(char*, size_t, const char*, ...);
 #define ARRAY_END(a)  ((a) + ARRAY_SIZE(a))
 
 void uv__realm_time_update(uv_loop_t* loop, uint64_t real_time_ms);
+int uv__realm_grid_timeout(int timeout);
 
 #define container_of(ptr, type, member) \
   ((type *) ((char *) (ptr) - offsetof(type, member)))

@@ -24,6 +24,7 @@
 
 #include <assert.h>
 #include <errno.h>
+#include <limits.h>
 #include <math.h>
 #include <stdarg.h>
 #include <stddef.h> /* NULL */
@@ -862,16 +863,80 @@ static int uv__realm_time_frozen;
 static double uv__realm_time_offset_ms;
 static double uv__realm_time_frozen_ms;
 
+/* REX_TIMER_GRID_MS emulates a coarse scheduler tick on every platform by
+ * rounding poll timeouts up to absolute grid boundaries.  15.625 reproduces
+ * the Windows default 64Hz tick that a stock Windows Node inherits; unset or
+ * 0 keeps the native timer resolution.  Parsed once, immutable afterwards. */
+static double uv__realm_timer_grid_ms;
+
+
+static void uv__realm_time_read_grid(void) {
+  const char* raw;
+  char* end;
+  double grid;
+#ifdef _WIN32
+  char buffer[64];
+  DWORD length;
+
+  length = GetEnvironmentVariableA("REX_TIMER_GRID_MS", buffer, sizeof(buffer));
+  if (length >= sizeof(buffer)) {
+    fprintf(stderr, "REX_TIMER_GRID_MS: value too long\n");
+    abort();
+  }
+  raw = length == 0 ? NULL : buffer;
+#else
+  raw = getenv("REX_TIMER_GRID_MS");
+#endif
+
+  uv__realm_timer_grid_ms = 0;
+  if (raw == NULL || *raw == '\0')
+    return;
+
+  grid = strtod(raw, &end);
+  if (end == raw || *end != '\0' || !isfinite(grid) || grid < 0) {
+    fprintf(stderr, "REX_TIMER_GRID_MS: invalid value '%s'\n", raw);
+    abort();
+  }
+  uv__realm_timer_grid_ms = grid;
+}
+
 
 static void uv__realm_time_init_once(void) {
   if (uv_mutex_init(&uv__realm_time_mutex) != 0)
     abort();
+  uv__realm_time_read_grid();
 }
 
 
 static void uv__realm_time_lock(void) {
   uv_once(&uv__realm_time_once, uv__realm_time_init_once);
   uv_mutex_lock(&uv__realm_time_mutex);
+}
+
+
+int uv__realm_grid_timeout(int timeout) {
+  double grid;
+  double now_ms;
+  double boundary_ms;
+  double wait_ms;
+
+  uv_once(&uv__realm_time_once, uv__realm_time_init_once);
+  grid = uv__realm_timer_grid_ms;
+  if (grid <= 0 || timeout <= 0)
+    return timeout;
+
+  /* Anchor the grid to the monotonic clock origin so consecutive wakeups ride
+   * one absolute tick train, exactly like a scheduler tick.  A deadline that
+   * lands between ticks waits for the next tick, which is what turns a 1ms
+   * timer chain into a 15.6ms cadence on a stock Windows Node. */
+  now_ms = (double) uv_hrtime() / 1e6;
+  boundary_ms = ceil((now_ms + (double) timeout) / grid) * grid;
+  wait_ms = ceil(boundary_ms - now_ms);
+  if (wait_ms < (double) timeout)
+    wait_ms = (double) timeout;
+  if (wait_ms > (double) INT_MAX)
+    wait_ms = (double) INT_MAX;
+  return (int) wait_ms;
 }
 
 

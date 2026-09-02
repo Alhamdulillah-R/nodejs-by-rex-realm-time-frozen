@@ -317,8 +317,9 @@ static double PerformanceNowImpl(Isolate*) {
   const uint64_t real_now = uv_hrtime();
   const double observable_now =
       realm_time::CurrentMonotonicTimeNanoseconds(real_now);
-  return (observable_now - static_cast<double>(performance_process_start)) /
-         NANOS_PER_MILLIS;
+  return realm_time::ClampObservableMilliseconds(
+      (observable_now - static_cast<double>(performance_process_start)) /
+      NANOS_PER_MILLIS);
 }
 
 static double FastPerformanceNow(v8::Local<v8::Value> receiver) {
