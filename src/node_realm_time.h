@@ -144,10 +144,20 @@ double CurrentMonotonicTimeNanoseconds(uint64_t real_monotonic_time_ns);
 //                            DOMHighResTimeStamp derived from it.  Unset or 0
 //                            keeps the raw hrtime; 100000 reproduces a
 //                            non-isolated Blink renderer (100us).
-// Port of Blink TimeClamper: floor to the quantum, then step one quantum up
-// once the raw value crosses a per-process keyed pseudo-random threshold, so
-// the emitted distribution matches a renderer rather than a bare floor().
-double ClampObservableMilliseconds(double milliseconds);
+// Port of Blink TimeClamper (time_clamper.cc): floor to the quantum, then
+// step one quantum up once the raw value crosses a per-process keyed
+// pseudo-random threshold, so the emitted distribution matches a renderer
+// rather than a bare floor().  Applied to absolute monotonic microseconds,
+// exactly as Blink applies it to TimeTicks::since_origin().
+int64_t ClampObservableMicroseconds(int64_t microseconds);
+
+// performance.now() the way Blink computes it (performance.cc
+// MonotonicTimeToDOMHighResTimeStamp): clamp the absolute now and the
+// absolute origin separately, convert each to a millisecond double, then
+// subtract.  The subtraction of two large doubles is what gives a renderer
+// its characteristic ~1e-9 ms float noise; subtracting first would not.
+// With the quantum disabled this is the plain (now - origin) / 1e6.
+double ObservableElapsedMilliseconds(double now_ns, double origin_ns);
 
 //   REX_TIMER_NESTING_CLAMP=1 Blink DOMTimer nesting semantics in
 //                            lib/internal/timers.js (queried via timers.cc).

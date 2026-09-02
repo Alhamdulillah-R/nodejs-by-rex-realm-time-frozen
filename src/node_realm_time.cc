@@ -749,32 +749,43 @@ double UnitIntervalFromHash(uint64_t hash) {
   return result - 1.0;
 }
 
-double ClampToRendererQuantum(double milliseconds) {
+// Blink splits the value into its lower ten decimal digits and the rest so
+// the threshold hash sees small numbers; keep that so the dithering is
+// bit-for-bit the renderer's given the same secret.
+constexpr int64_t kTenLowerDigitsMod = INT64_C(10000000000);
+
+int64_t ClampToRendererQuantum(int64_t microseconds) {
   const ClockSurfaceConfig& config = GetClockSurfaceConfig();
-  if (config.resolution_ns <= 0 || !std::isfinite(milliseconds)) {
-    return milliseconds;
+  // The quantum is configured in nanoseconds; Blink works in microseconds.
+  const int64_t resolution = config.resolution_ns / 1000;
+  if (resolution <= 0) return microseconds;
+
+  bool negative = false;
+  if (microseconds < 0) {
+    negative = true;
+    microseconds =
+        -std::max(-std::numeric_limits<int64_t>::max(), microseconds);
   }
-  const bool negative = milliseconds < 0;
-  // Work on integer nanoseconds.  The input is an exact nanosecond count that
-  // was divided by 1e6, so rounding recovers it and keeps the bucket math
-  // exact; the final /1e6 then yields the same doubles a renderer gets from
-  // microseconds/1000 (e.g. 419744.8999999985) and a stock Windows Node gets
-  // from QPC nanoseconds/1e6 (e.g. 108.9432).
-  const double raw_ns_d = std::fabs(milliseconds) * 1e6;
-  // Beyond int64 range there is nothing meaningful to quantize.
-  if (raw_ns_d >= 9.0e18) return milliseconds;
-  const int64_t raw_ns = std::llround(raw_ns_d);
-  int64_t bucket_ns = raw_ns - raw_ns % config.resolution_ns;
+  const int64_t lower_digits = microseconds % kTenLowerDigitsMod;
+  int64_t upper_digits = microseconds - lower_digits;
+
+  int64_t clamped = lower_digits - lower_digits % resolution;
   const uint64_t hash =
-      MurmurHash3Finalize(static_cast<uint64_t>(bucket_ns) ^ config.secret);
-  const double threshold_ns =
-      static_cast<double>(bucket_ns) +
-      static_cast<double>(config.resolution_ns) * UnitIntervalFromHash(hash);
-  if (static_cast<double>(raw_ns) >= threshold_ns) {
-    bucket_ns += config.resolution_ns;
-  }
-  const double result = static_cast<double>(bucket_ns) / 1e6;
-  return negative ? -result : result;
+      MurmurHash3Finalize(static_cast<uint64_t>(clamped) ^ config.secret);
+  const double threshold =
+      static_cast<double>(clamped) +
+      static_cast<double>(resolution) * UnitIntervalFromHash(hash);
+  if (static_cast<double>(lower_digits) >= threshold) clamped += resolution;
+
+  upper_digits =
+      std::min(upper_digits, std::numeric_limits<int64_t>::max() - clamped);
+  clamped += upper_digits;
+  return negative ? -clamped : clamped;
+}
+
+// TimeDelta::InMillisecondsF(): microseconds / 1000.0 as a double.
+double MicrosecondsToMillisecondsF(int64_t microseconds) {
+  return static_cast<double>(microseconds) / 1000.0;
 }
 
 #ifdef _WIN32
@@ -2233,8 +2244,22 @@ double CurrentMonotonicTimeNanoseconds(uint64_t real_monotonic_time_ns) {
          snapshot.monotonic_time_offset_ns;
 }
 
-double ClampObservableMilliseconds(double milliseconds) {
-  return ClampToRendererQuantum(milliseconds);
+int64_t ClampObservableMicroseconds(int64_t microseconds) {
+  return ClampToRendererQuantum(microseconds);
+}
+
+double ObservableElapsedMilliseconds(double now_ns, double origin_ns) {
+  const ClockSurfaceConfig& config = GetClockSurfaceConfig();
+  if (config.resolution_ns / 1000 <= 0 || !std::isfinite(now_ns) ||
+      !std::isfinite(origin_ns)) {
+    return (now_ns - origin_ns) / 1e6;
+  }
+  // TimeTicks carries microseconds; uv_hrtime carries nanoseconds.
+  const int64_t now_us = static_cast<int64_t>(std::floor(now_ns / 1000.0));
+  const int64_t origin_us =
+      static_cast<int64_t>(std::floor(origin_ns / 1000.0));
+  return MicrosecondsToMillisecondsF(ClampToRendererQuantum(now_us)) -
+         MicrosecondsToMillisecondsF(ClampToRendererQuantum(origin_us));
 }
 
 bool TimerNestingClampEnabled() {

@@ -95,8 +95,11 @@ void PerformanceState::Initialize(uint64_t time_origin,
   // The time origin milestone is not exposed to user land.
   this->milestones[NODE_PERFORMANCE_MILESTONE_TIME_ORIGIN] =
       static_cast<double>(time_origin);
+  // Blink clamps timeOrigin like every other DOMHighResTimeStamp, so with the
+  // quantum enabled it lands on the same 100us grid (e.g. 1788359426323.1).
   this->milestones[NODE_PERFORMANCE_MILESTONE_TIME_ORIGIN_TIMESTAMP] =
-      time_origin_timestamp;
+      static_cast<double>(realm_time::ClampObservableMicroseconds(
+          static_cast<int64_t>(time_origin_timestamp)));
 }
 
 void PerformanceState::Deserialize(v8::Local<v8::Context> context,
@@ -317,9 +320,8 @@ static double PerformanceNowImpl(Isolate*) {
   const uint64_t real_now = uv_hrtime();
   const double observable_now =
       realm_time::CurrentMonotonicTimeNanoseconds(real_now);
-  return realm_time::ClampObservableMilliseconds(
-      (observable_now - static_cast<double>(performance_process_start)) /
-      NANOS_PER_MILLIS);
+  return realm_time::ObservableElapsedMilliseconds(
+      observable_now, static_cast<double>(performance_process_start));
 }
 
 static double FastPerformanceNow(v8::Local<v8::Value> receiver) {

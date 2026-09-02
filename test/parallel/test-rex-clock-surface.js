@@ -44,21 +44,26 @@ const off = {
     let backwards = 0;
     for (let i = 1; i < v.length; i++) if (v[i] < v[i - 1]) backwards++;
     const e = new Event('x');
+    // Blink shape: values sit on the 0.1ms grid only up to the float noise of
+    // clamp(now) - clamp(origin), and timeOrigin is on the grid too.
     console.log(JSON.stringify({
       distinct: new Set(v).size,
       offGrid: v.filter((x) => !onGrid(x)).length,
       backwards,
       eventOnGrid: onGrid(e.timeStamp),
+      originOnGrid: (String(performance.timeOrigin).split('.')[1] || '').length <= 1,
     }));
   `);
   assert.strictEqual(r.offGrid, 0);
   assert.strictEqual(r.backwards, 0);
   assert.ok(r.distinct < 10000, `distinct=${r.distinct}`);
   assert.strictEqual(r.eventOnGrid, true);
+  assert.strictEqual(r.originOnGrid, true);
 }
 
-// 3. Nesting clamp: a top-level 0 stays 0, the fifth nested timer is raised
-//    to 4ms, exactly like Blink's kMaxTimerNestingLevel / kMinimumInterval.
+// 3. Nesting clamp: a top-level 0 stays 0, the seventh timer of a chain is
+//    the first raised to 4ms (Chrome 152: kSpecCompliantMaxTimerNestingLevel
+//    = 6, clamp when nesting_level > 6).
 {
   const r = runChild({ ...off, REX_TIMER_NESTING_CLAMP: '1' }, `
     const levels = [];
@@ -67,14 +72,14 @@ const off = {
     clearTimeout(top);
     (function chain() {
       const t = setTimeout(() => {
-        if (levels.length < 8) chain();
+        if (levels.length < 9) chain();
         else console.log(JSON.stringify({ topIdle, levels }));
       }, 0);
       levels.push(t._idleTimeout);
     })();
   `);
   assert.strictEqual(r.topIdle, 0);
-  assert.deepStrictEqual(r.levels, [0, 0, 0, 0, 4, 4, 4, 4]);
+  assert.deepStrictEqual(r.levels, [0, 0, 0, 0, 0, 0, 4, 4, 4]);
 }
 
 // 4. Grid: a 1ms timer chain follows the 15.625ms tick train.
