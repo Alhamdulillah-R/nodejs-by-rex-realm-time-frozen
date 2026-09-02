@@ -110,6 +110,13 @@ const off = {
     const desc = Object.getOwnPropertyDescriptor(globalThis, 'RexMirror');
     const before = RexMirror.clock.get();
     const chrome = RexMirror.clock.use('chrome');
+    const host = RexMirror.clock.hostPlatform;
+    const expectedChrome = RexMirror.clock.presets.chrome[host];
+    const chromeWindows = RexMirror.clock.use('chrome', 'windows');
+    const nodeWindows = RexMirror.clock.use('node', 'windows');
+    let badPlatform = null;
+    try { RexMirror.clock.use('chrome', 'mac'); } catch (e) { badPlatform = e.code; }
+    RexMirror.clock.use('chrome');
     const t = setTimeout(() => {}, 0);
     const idle = t._idleTimeout;
     clearTimeout(t);
@@ -119,31 +126,50 @@ const off = {
     try { RexMirror.clock.set({ resolutionNs: -1 }); } catch (e) { bad = e.name; }
     let badName = null;
     try { RexMirror.clock.use('nope'); } catch (e) { badName = e.code; }
+    // platformTimerResolutionMs is informational and machine-specific.
+    const pick = ({ resolutionNs, nestingClamp, timerGridMs, highResolutionTimer }) =>
+      ({ resolutionNs, nestingClamp, timerGridMs, highResolutionTimer });
     console.log(JSON.stringify({
       enumerable: desc.enumerable,
       writable: desc.writable,
       inKeys: Object.keys(globalThis).includes('RexMirror'),
-      before, chrome, idle,
+      before: pick(before), chrome: pick(chrome), idle,
+      expectedChrome: pick(expectedChrome),
+      chromeWindows: pick(chromeWindows), nodeWindows: pick(nodeWindows),
+      badPlatform,
+      platformResolutionIsNumber: typeof chrome.platformTimerResolutionMs === 'number',
       offGrid: v.filter((x) => !onGrid(x)).length,
       distinct: new Set(v).size,
       bad, badName,
-      after: RexMirror.clock.set({ timerGridMs: 15.625 }),
+      after: pick(RexMirror.clock.set({ timerGridMs: 15.625 })),
     }));
   `);
   assert.strictEqual(r.enumerable, false);
   assert.strictEqual(r.writable, false);
   assert.strictEqual(r.inKeys, false);
-  assert.deepStrictEqual(r.before,
-                         { resolutionNs: 0, nestingClamp: false, timerGridMs: 0 });
-  assert.deepStrictEqual(r.chrome,
-                         { resolutionNs: 100000, nestingClamp: true, timerGridMs: 0 });
+  assert.deepStrictEqual(r.before, {
+    resolutionNs: 0, nestingClamp: false, timerGridMs: 0,
+    highResolutionTimer: false,
+  });
+  assert.deepStrictEqual(r.chrome, r.expectedChrome);
+  assert.deepStrictEqual(r.chromeWindows, {
+    resolutionNs: 100000, nestingClamp: true, timerGridMs: 1,
+    highResolutionTimer: true,
+  });
+  assert.deepStrictEqual(r.nodeWindows, {
+    resolutionNs: 100, nestingClamp: false, timerGridMs: 15.625,
+    highResolutionTimer: false,
+  });
+  assert.strictEqual(r.badPlatform, 'ERR_INVALID_ARG_VALUE');
+  assert.strictEqual(r.platformResolutionIsNumber, true);
   assert.strictEqual(r.idle, 0);
   assert.strictEqual(r.offGrid, 0);
   assert.ok(r.distinct < 2500, `distinct=${r.distinct}`);
   assert.strictEqual(r.bad, 'RangeError');
   assert.strictEqual(r.badName, 'ERR_INVALID_ARG_VALUE');
-  assert.deepStrictEqual(r.after,
-                         { resolutionNs: 100000, nestingClamp: true, timerGridMs: 15.625 });
+  assert.deepStrictEqual(r.after, {
+    ...r.expectedChrome, timerGridMs: 15.625,
+  });
 }
 
 // 6. Invalid environment values fail loudly instead of being ignored.

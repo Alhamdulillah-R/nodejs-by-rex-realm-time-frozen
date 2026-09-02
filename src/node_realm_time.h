@@ -150,8 +150,16 @@ struct ClockSurfaceSettings {
   int64_t resolution_ns;
   bool nesting_clamp;
   double timer_grid_ms;
+  // Windows: request a 1ms system timer (NtSetTimerResolution) the way a
+  // foreground Chrome renderer does, so DOMTimer's 4ms clamp is really 4ms
+  // instead of the 15.625ms default tick.  Accepted but a no-op on other
+  // platforms, whose timers are already high resolution.
+  bool high_resolution_timer;
 };
 ClockSurfaceSettings GetClockSurfaceSettings();
+// Current OS timer resolution in milliseconds (NtQueryTimerResolution on
+// Windows, clock_getres elsewhere), for diagnostics.
+double PlatformTimerResolutionMs();
 // Applies every field; on a rejected value nothing changes and *error names
 // the offending field.
 bool SetClockSurfaceSettings(const ClockSurfaceSettings& settings,

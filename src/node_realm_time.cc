@@ -38,6 +38,7 @@
 #include <netinet/in.h>
 #include <sys/socket.h>
 #include <sys/time.h>
+#include <time.h>
 #include <unistd.h>
 #endif
 
@@ -687,6 +688,7 @@ struct ClockSurfaceConfig {
   int64_t resolution_ns;
   uint64_t secret;
   bool nesting_clamp;
+  bool high_resolution_timer;
 };
 
 uint64_t RandomClockSecret() {
@@ -700,8 +702,76 @@ uint64_t RandomClockSecret() {
 struct ClockSurfaceState {
   std::atomic<int64_t> resolution_ns{0};
   std::atomic<bool> nesting_clamp{false};
+  std::atomic<bool> high_resolution_timer{false};
   uint64_t secret = 0;
 };
+
+#ifdef _WIN32
+// Chrome raises the system timer through ntdll rather than winmm's
+// timeBeginPeriod; do the same so the effect (and its footprint) match.
+using NtSetTimerResolutionFn = LONG(NTAPI*)(ULONG, BOOLEAN, PULONG);
+using NtQueryTimerResolutionFn = LONG(NTAPI*)(PULONG, PULONG, PULONG);
+constexpr ULONG kOneMillisecondIn100ns = 10000;
+constexpr LONG kStatusTimerResolutionNotSet = static_cast<LONG>(0xC0000245);
+
+NtSetTimerResolutionFn NtSetTimerResolutionPtr() {
+  static const NtSetTimerResolutionFn fn = [] {
+    HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
+    return ntdll == nullptr ? nullptr
+                            : reinterpret_cast<NtSetTimerResolutionFn>(
+                                  GetProcAddress(ntdll, "NtSetTimerResolution"));
+  }();
+  return fn;
+}
+
+NtQueryTimerResolutionFn NtQueryTimerResolutionPtr() {
+  static const NtQueryTimerResolutionFn fn = [] {
+    HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
+    return ntdll == nullptr ? nullptr
+                            : reinterpret_cast<NtQueryTimerResolutionFn>(
+                                  GetProcAddress(ntdll, "NtQueryTimerResolution"));
+  }();
+  return fn;
+}
+
+bool ApplyHighResolutionTimer(bool enable, std::string* error) {
+  NtSetTimerResolutionFn set_resolution = NtSetTimerResolutionPtr();
+  if (set_resolution == nullptr) {
+    *error = "highResolutionTimer: NtSetTimerResolution is unavailable";
+    return false;
+  }
+  ULONG actual = 0;
+  const LONG status =
+      set_resolution(kOneMillisecondIn100ns, enable ? TRUE : FALSE, &actual);
+  // Releasing a request this process never made is not an error.
+  if (status < 0 && !(status == kStatusTimerResolutionNotSet && !enable)) {
+    *error = "highResolutionTimer: NtSetTimerResolution failed";
+    return false;
+  }
+  return true;
+}
+
+double PlatformTimerResolutionMs() {
+  NtQueryTimerResolutionFn query = NtQueryTimerResolutionPtr();
+  if (query == nullptr) return 0;
+  ULONG minimum = 0;
+  ULONG maximum = 0;
+  ULONG current = 0;
+  if (query(&minimum, &maximum, &current) < 0) return 0;
+  return static_cast<double>(current) / kOneMillisecondIn100ns;
+}
+#else
+bool ApplyHighResolutionTimer(bool, std::string*) {
+  return true;
+}
+
+double PlatformTimerResolutionMs() {
+  struct timespec resolution;
+  if (clock_getres(CLOCK_MONOTONIC, &resolution) != 0) return 0;
+  return static_cast<double>(resolution.tv_sec) * 1e3 +
+         static_cast<double>(resolution.tv_nsec) / 1e6;
+}
+#endif
 
 ClockSurfaceConfig ParseClockSurfaceEnvironment(uint64_t secret);
 
@@ -716,6 +786,15 @@ ClockSurfaceState& ClockSurface() {
                               std::memory_order_relaxed);
     state.nesting_clamp.store(initial.nesting_clamp,
                               std::memory_order_relaxed);
+    state.high_resolution_timer.store(initial.high_resolution_timer,
+                                      std::memory_order_relaxed);
+    if (initial.high_resolution_timer) {
+      std::string error;
+      if (!ApplyHighResolutionTimer(true, &error)) {
+        fprintf(stderr, "REX_TIMER_HIGHRES: %s\n", error.c_str());
+        exit(9);
+      }
+    }
   });
   return state;
 }
@@ -726,12 +805,13 @@ ClockSurfaceConfig GetClockSurfaceConfig() {
   return ClockSurfaceConfig{
       state.resolution_ns.load(std::memory_order_relaxed),
       state.secret,
-      state.nesting_clamp.load(std::memory_order_relaxed)};
+      state.nesting_clamp.load(std::memory_order_relaxed),
+      state.high_resolution_timer.load(std::memory_order_relaxed)};
 }
 
 ClockSurfaceConfig ParseClockSurfaceEnvironment(uint64_t secret) {
   {
-    ClockSurfaceConfig result{0, secret, false};
+    ClockSurfaceConfig result{0, secret, false, false};
     std::string raw;
     if (credentials::SafeGetenv("REX_CLOCK_RESOLUTION_NS", &raw) &&
         !raw.empty()) {
@@ -758,6 +838,17 @@ ClockSurfaceConfig ParseClockSurfaceEnvironment(uint64_t secret) {
         exit(9);
       }
       result.nesting_clamp = true;
+    }
+    raw.clear();
+    if (credentials::SafeGetenv("REX_TIMER_HIGHRES", &raw) && !raw.empty() &&
+        raw != "0") {
+      if (raw != "1") {
+        fprintf(stderr,
+                "REX_TIMER_HIGHRES: must be 0 or 1, got '%s'\n",
+                raw.c_str());
+        exit(9);
+      }
+      result.high_resolution_timer = true;
     }
     return result;
   }
@@ -1488,6 +1579,16 @@ Local<Object> ClockSurfaceToObject(Environment* env,
             OneByteString(isolate, "timerGridMs"),
             Number::New(isolate, settings.timer_grid_ms))
       .Check();
+  result
+      ->Set(context,
+            OneByteString(isolate, "highResolutionTimer"),
+            Boolean::New(isolate, settings.high_resolution_timer))
+      .Check();
+  result
+      ->Set(context,
+            OneByteString(isolate, "platformTimerResolutionMs"),
+            Number::New(isolate, PlatformTimerResolutionMs()))
+      .Check();
   return result;
 }
 
@@ -1558,6 +1659,18 @@ void SetClockSurfaceBinding(const FunctionCallbackInfo<Value>& args) {
       return;
     }
     settings.timer_grid_ms = grid;
+  }
+
+  if (!options->Get(context, OneByteString(isolate, "highResolutionTimer"))
+           .ToLocal(&value)) {
+    return;
+  }
+  if (!value->IsUndefined()) {
+    if (!value->IsBoolean()) {
+      env->ThrowTypeError("highResolutionTimer must be a boolean");
+      return;
+    }
+    settings.high_resolution_timer = value->IsTrue();
   }
 
   std::string error;
@@ -2410,7 +2523,8 @@ ClockSurfaceSettings GetClockSurfaceSettings() {
   const ClockSurfaceConfig config = GetClockSurfaceConfig();
   return ClockSurfaceSettings{config.resolution_ns,
                               config.nesting_clamp,
-                              uv_realm_timer_grid_get()};
+                              uv_realm_timer_grid_get(),
+                              config.high_resolution_timer};
 }
 
 bool SetClockSurfaceSettings(const ClockSurfaceSettings& settings,
@@ -2425,6 +2539,14 @@ bool SetClockSurfaceSettings(const ClockSurfaceSettings& settings,
     return false;
   }
   ClockSurfaceState& state = ClockSurface();
+  if (settings.high_resolution_timer !=
+      state.high_resolution_timer.load(std::memory_order_relaxed)) {
+    if (!ApplyHighResolutionTimer(settings.high_resolution_timer, error)) {
+      return false;
+    }
+    state.high_resolution_timer.store(settings.high_resolution_timer,
+                                      std::memory_order_relaxed);
+  }
   state.resolution_ns.store(settings.resolution_ns, std::memory_order_relaxed);
   state.nesting_clamp.store(settings.nesting_clamp, std::memory_order_relaxed);
   return true;
