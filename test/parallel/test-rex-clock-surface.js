@@ -172,7 +172,41 @@ const off = {
   });
 }
 
-// 6. Invalid environment values fail loudly instead of being ignored.
+// 6. Time zone: IANA names apply to the whole isolate (vm contexts too),
+//    bad names throw, get() reports the zone.
+{
+  const r = runChild(off, `
+    const vm = require('vm');
+    const ctx = vm.createContext({});
+    const taipei = RexMirror.clock.setTimeZone('Asia/Taipei');
+    const offTaipei = new Date(Date.UTC(2026, 0, 15)).getTimezoneOffset();
+    const ctxTaipei = vm.runInContext('new Date(Date.UTC(2026, 0, 15)).getTimezoneOffset()', ctx);
+    const ny = RexMirror.clock.set({ timeZone: 'America/New_York' });
+    const offNy = new Date(Date.UTC(2026, 0, 15)).getTimezoneOffset();
+    const intlNy = new Intl.DateTimeFormat('en-US').resolvedOptions().timeZone;
+    let bad = null;
+    try { RexMirror.clock.setTimeZone('Mars/Olympus'); } catch (e) { bad = e.code; }
+    let badType = null;
+    try { RexMirror.clock.set({ timeZone: 5 }); } catch (e) { badType = e.code; }
+    console.log(JSON.stringify({
+      taipeiTz: taipei.timeZone, taipeiOff: taipei.timezoneOffsetMinutes,
+      offTaipei, ctxTaipei,
+      nyTz: ny.timeZone, offNy, intlNy, bad, badType,
+      stillNy: RexMirror.clock.get().timeZone,
+    }));
+  `);
+  assert.strictEqual(r.taipeiTz, 'Asia/Taipei');
+  assert.strictEqual(r.offTaipei, -480);
+  assert.strictEqual(r.ctxTaipei, -480);
+  assert.strictEqual(r.nyTz, 'America/New_York');
+  assert.strictEqual(r.offNy, 300);
+  assert.strictEqual(r.intlNy, 'America/New_York');
+  assert.strictEqual(r.bad, 'ERR_INVALID_ARG_VALUE');
+  assert.strictEqual(r.badType, 'ERR_INVALID_ARG_TYPE');
+  assert.strictEqual(r.stillNy, 'America/New_York');
+}
+
+// 7. Invalid environment values fail loudly instead of being ignored.
 {
   const result = spawnSync(process.execPath, ['-e', '0'], {
     env: { ...process.env, ...off, REX_TIMER_NESTING_CLAMP: 'yes' },
