@@ -316,30 +316,52 @@ void MarkBootstrapComplete(const FunctionCallbackInfo<Value>& args) {
       performance::NODE_PERFORMANCE_MILESTONE_BOOTSTRAP_COMPLETE);
 }
 
-static double PerformanceNowImpl(Isolate*) {
-  const uint64_t real_now = uv_hrtime();
+static double PerformanceNowImpl(uint64_t real_now) {
   // The rule offset shifts the absolute now before clamping, so a page that
   // "has been open longer" keeps the renderer's quantisation and float shape.
   const double observable_now =
       realm_time::CurrentMonotonicTimeNanoseconds(real_now) +
       realm_time::PerformanceNowOffsetNanoseconds();
-  const double result = realm_time::ObservableElapsedMilliseconds(
+  return realm_time::ObservableElapsedMilliseconds(
       observable_now, static_cast<double>(performance_process_start));
-  realm_time::TraceClockRead(
-      realm_time::ClockTraceKind::kPerformanceNow, real_now, result, 0, 0);
-  return result;
 }
 
+// The stock fast path stays trace-free: a fast API call cannot touch the JS
+// heap, so it cannot attribute a read to its context.  While the clock trace
+// is on, lib/internal/perf/utils.js routes now() through `nowTraced` instead,
+// which records the read together with the observing context.
 static double FastPerformanceNow(v8::Local<v8::Value> receiver) {
-  return PerformanceNowImpl(Isolate::GetCurrent());
+  return PerformanceNowImpl(uv_hrtime());
 }
 
 static void SlowPerformanceNow(const FunctionCallbackInfo<Value>& args) {
-  args.GetReturnValue().Set(PerformanceNowImpl(args.GetIsolate()));
+  args.GetReturnValue().Set(PerformanceNowImpl(uv_hrtime()));
+}
+
+static void TracedPerformanceNow(const FunctionCallbackInfo<Value>& args) {
+  const uint64_t real_now = uv_hrtime();
+  const double result = PerformanceNowImpl(real_now);
+  realm_time::TraceClockRead(
+      realm_time::ClockTraceKind::kPerformanceNow,
+      real_now,
+      result,
+      0,
+      static_cast<double>(realm_time::ObservedContextOf(args.GetIsolate())));
+  args.GetReturnValue().Set(result);
+}
+
+static bool FastClockTraceEnabled(v8::Local<v8::Value> receiver) {
+  return realm_time::ClockTraceEnabled();
+}
+
+static void SlowClockTraceEnabled(const FunctionCallbackInfo<Value>& args) {
+  args.GetReturnValue().Set(realm_time::ClockTraceEnabled());
 }
 
 static v8::CFunction fast_performance_now(
     v8::CFunction::Make(FastPerformanceNow));
+static v8::CFunction fast_clock_trace_enabled(
+    v8::CFunction::Make(FastClockTraceEnabled));
 
 static void CreatePerIsolateProperties(IsolateData* isolate_data,
                                        Local<ObjectTemplate> target) {
@@ -363,6 +385,12 @@ static void CreatePerIsolateProperties(IsolateData* isolate_data,
   SetMethod(isolate, target, "uvMetricsInfo", UvMetricsInfo);
   SetFastMethodNoSideEffect(
       isolate, target, "now", SlowPerformanceNow, &fast_performance_now);
+  SetFastMethodNoSideEffect(isolate,
+                            target,
+                            "clockTraceEnabled",
+                            SlowClockTraceEnabled,
+                            &fast_clock_trace_enabled);
+  SetMethod(isolate, target, "nowTraced", TracedPerformanceNow);
 }
 
 void CreatePerContextProperties(Local<Object> target,
@@ -431,6 +459,9 @@ void RegisterExternalReferences(ExternalReferenceRegistry* registry) {
   registry->Register(UvMetricsInfo);
   registry->Register(SlowPerformanceNow);
   registry->Register(fast_performance_now);
+  registry->Register(SlowClockTraceEnabled);
+  registry->Register(fast_clock_trace_enabled);
+  registry->Register(TracedPerformanceNow);
   HistogramBase::RegisterExternalReferences(registry);
   IntervalHistogram::RegisterExternalReferences(registry);
   IterationHistogram::RegisterExternalReferences(registry);

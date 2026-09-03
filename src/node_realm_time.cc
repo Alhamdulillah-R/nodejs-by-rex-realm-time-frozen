@@ -1257,11 +1257,13 @@ int64_t RealmDateNowCallback(Isolate* isolate, int64_t real_time_millis) {
     return real_time_millis;
   }
   const int64_t floored = static_cast<int64_t>(std::floor(result));
-  TraceClockRead(ClockTraceKind::kDate,
-                 uv_hrtime(),
-                 static_cast<double>(floored),
-                 0,
-                 0);
+  if (ClockTraceEnabled()) {
+    TraceClockRead(ClockTraceKind::kDate,
+                   uv_hrtime(),
+                   static_cast<double>(floored),
+                   0,
+                   static_cast<double>(ObservedContextOf(isolate)));
+  }
   return floored;
 }
 
@@ -2815,6 +2817,29 @@ void TraceClockRead(ClockTraceKind kind,
                           static_cast<uint8_t>(kind)};
   trace.head = (trace.head + 1) % trace.ring.size();
   trace.total++;
+}
+
+bool ClockTraceEnabled() {
+  return ClockTrace().enabled.load(std::memory_order_relaxed);
+}
+
+ObservedContext ObservedContextOf(Isolate* isolate) {
+  if (isolate == nullptr || !isolate->InContext()) {
+    return ObservedContext::kUnknown;
+  }
+  Local<Context> context = isolate->GetCurrentContext();
+  if (context.IsEmpty() || !ContextEmbedderTag::IsNodeContext(context)) {
+    return ObservedContext::kUnknown;
+  }
+  if (Realm::GetCurrent(context) != nullptr) {
+    return ObservedContext::kNodeRealm;
+  }
+  auto* contextify_context = static_cast<contextify::ContextifyContext*>(
+      context->GetAlignedPointerFromEmbedderData(
+          ContextEmbedderIndex::kContextifyContext,
+          EmbedderDataTag::kPerContextData));
+  return contextify_context == nullptr ? ObservedContext::kUnknown
+                                       : ObservedContext::kVmContext;
 }
 
 double PerformanceNowOffsetNanoseconds() {

@@ -203,6 +203,14 @@ void TraceClockRead(ClockTraceKind kind,
                     double value,
                     double aux0,
                     double aux1);
+// Cheap check for hot paths that must stay off the trace when it is idle
+// (the performance.now fast API call falls back to the slow path only while
+// tracing, so the read can be attributed to a context).
+bool ClockTraceEnabled();
+// Which context observed a clock read: 0 = a Node realm (framework code),
+// 1 = a contextified vm.Context (target code), 2 = unknown / no context.
+enum class ObservedContext : uint8_t { kNodeRealm = 0, kVmContext = 1, kUnknown = 2 };
+ObservedContext ObservedContextOf(v8::Isolate* isolate);
 
 // Clock rules (RexMirror.clock.rules): constant shifts applied inside the
 // runtime so the observable shape stays consistent.  The performance.now

@@ -228,11 +228,27 @@ const off = {
       const create = out.records.find((x) => x.kind === 'timer.create');
       const fire = out.records.find((x) => x.kind === 'timer.fire');
       const perf = out.records.find((x) => x.kind === 'performance.now');
+      const date = out.records.find((x) => x.kind === 'date');
+      const vm = require('vm');
+      RexMirror.clock.trace.start({ capacity: 100 });
+      vm.runInNewContext('performance.now(); Date.now();', { performance });
+      const vmOut = RexMirror.clock.trace.drain();
+      const vmContexts = vmOut.records.map((x) => x.kind + ':' + x.context);
+      // runAsTask dispatches like a fresh browser task: nesting level 0 inside.
+      const taskLevels = {
+        inner: RexMirror.clock.timers.nestingLevel(),
+        insideTask: RexMirror.clock.timers.runAsTask(() => RexMirror.clock.timers.nestingLevel()),
+        after: RexMirror.clock.timers.nestingLevel(),
+      };
+      let badTask = null;
+      try { RexMirror.clock.timers.runAsTask(5); } catch (e) { badTask = e.code; }
       let bad = null;
       try { RexMirror.clock.rules.set({ dateOffsetMs: Infinity }); } catch (e) { bad = e.name; }
       let badCap = null;
       try { RexMirror.clock.trace.start({ capacity: 0 }); } catch (e) { badCap = e.name; }
       console.log(JSON.stringify({
+        perfContext: perf.context, dateContext: date.context, vmContexts,
+        taskLevels, badTask,
         rules, dateShift, perfAfterRule, perfOnGrid: onGrid(perfAfterRule),
         startedEnabled: started.enabled, stoppedEnabled: stopped.enabled,
         kinds, create, fire, perfValueOnGrid: onGrid(perf.value),
@@ -242,6 +258,14 @@ const off = {
       }));
     }, 5);
   `);
+  assert.strictEqual(r.perfContext, 'main');
+  assert.strictEqual(r.dateContext, 'main');
+  // performance.now attributes to the realm whose function ran: the main
+  // realm's performance object was handed into the vm, so its read is 'main';
+  // Date is the vm's own intrinsic, so that read is 'vm'.
+  assert.deepStrictEqual(r.vmContexts, ['performance.now:main', 'date:vm']);
+  assert.deepStrictEqual(r.taskLevels, { inner: 1, insideTask: 0, after: 1 });
+  assert.strictEqual(r.badTask, 'ERR_INVALID_ARG_TYPE');
   assert.deepStrictEqual(r.rules, { performanceNowOffsetMs: 1500, dateOffsetMs: -86400000 });
   assert.ok(r.dateShift >= 86399000 && r.dateShift <= 86401000, `dateShift=${r.dateShift}`);
   assert.ok(r.perfAfterRule >= 1500, `perf=${r.perfAfterRule}`);
