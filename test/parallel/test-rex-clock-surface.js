@@ -206,7 +206,68 @@ const off = {
   assert.strictEqual(r.stillNy, 'America/New_York');
 }
 
-// 7. Invalid environment values fail loudly instead of being ignored.
+// 7. Clock trace records every observable read; rules shift the clocks
+//    without touching the shape.
+{
+  const r = runChild({ ...off, REX_CLOCK_RESOLUTION_NS: '100000',
+                       REX_TIMER_NESTING_CLAMP: '1' }, `
+    const dateBefore = Date.now();
+    const rules = RexMirror.clock.rules.set({ performanceNowOffsetMs: 1500,
+                                              dateOffsetMs: -86400000 });
+    const dateShift = dateBefore - Date.now();
+    const perfAfterRule = performance.now();
+    const onGrid = (x) => Math.abs(x * 10 - Math.round(x * 10)) < 1e-6;
+    const started = RexMirror.clock.trace.start({ capacity: 1000 });
+    performance.now();
+    Date.now();
+    setTimeout(() => {
+      const out = RexMirror.clock.trace.drain();
+      const stopped = RexMirror.clock.trace.stop();
+      const kinds = {};
+      for (const rec of out.records) kinds[rec.kind] = (kinds[rec.kind] || 0) + 1;
+      const create = out.records.find((x) => x.kind === 'timer.create');
+      const fire = out.records.find((x) => x.kind === 'timer.fire');
+      const perf = out.records.find((x) => x.kind === 'performance.now');
+      let bad = null;
+      try { RexMirror.clock.rules.set({ dateOffsetMs: Infinity }); } catch (e) { bad = e.name; }
+      let badCap = null;
+      try { RexMirror.clock.trace.start({ capacity: 0 }); } catch (e) { badCap = e.name; }
+      console.log(JSON.stringify({
+        rules, dateShift, perfAfterRule, perfOnGrid: onGrid(perfAfterRule),
+        startedEnabled: started.enabled, stoppedEnabled: stopped.enabled,
+        kinds, create, fire, perfValueOnGrid: onGrid(perf.value),
+        ordered: out.records.every((x, i) => i === 0 || x.seq > out.records[i - 1].seq),
+        dropped: out.dropped, total: out.total, bad, badCap,
+        rawKeys: Object.keys(RexMirror.clock.trace.drain({ raw: true })),
+      }));
+    }, 5);
+  `);
+  assert.deepStrictEqual(r.rules, { performanceNowOffsetMs: 1500, dateOffsetMs: -86400000 });
+  assert.ok(r.dateShift >= 86399000 && r.dateShift <= 86401000, `dateShift=${r.dateShift}`);
+  assert.ok(r.perfAfterRule >= 1500, `perf=${r.perfAfterRule}`);
+  assert.strictEqual(r.perfOnGrid, true);
+  assert.strictEqual(r.startedEnabled, true);
+  assert.strictEqual(r.stoppedEnabled, false);
+  assert.ok(r.kinds['performance.now'] >= 1);
+  assert.ok(r.kinds.date >= 1);
+  assert.strictEqual(r.kinds['timer.create'], 1);
+  assert.strictEqual(r.kinds['timer.fire'], 1);
+  assert.strictEqual(r.create.requestedMs, 5);
+  assert.strictEqual(r.create.appliedMs, 5);
+  assert.strictEqual(r.create.nesting, 1);
+  assert.strictEqual(r.fire.scheduledMs, 5);
+  assert.ok(r.fire.elapsedMs >= 4, `elapsed=${r.fire.elapsedMs}`);
+  assert.strictEqual(r.perfValueOnGrid, true);
+  assert.strictEqual(r.ordered, true);
+  assert.strictEqual(r.dropped, 0);
+  assert.ok(r.total >= 4);
+  assert.strictEqual(r.bad, 'RangeError');
+  assert.strictEqual(r.badCap, 'RangeError');
+  assert.deepStrictEqual(r.rawKeys,
+                         ['count', 'seq', 'kind', 'realMs', 'value', 'aux0', 'aux1', 'dropped', 'total']);
+}
+
+// 8. Invalid environment values fail loudly instead of being ignored.
 {
   const result = spawnSync(process.execPath, ['-e', '0'], {
     env: { ...process.env, ...off, REX_TIMER_NESTING_CLAMP: 'yes' },

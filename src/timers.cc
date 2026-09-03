@@ -15,6 +15,7 @@ namespace timers {
 using v8::Context;
 using v8::Function;
 using v8::FunctionCallbackInfo;
+using v8::Int32;
 using v8::Isolate;
 using v8::Local;
 using v8::Number;
@@ -136,6 +137,23 @@ void BindingData::NestingClampEnabled(
   args.GetReturnValue().Set(realm_time::TimerNestingClampEnabled());
 }
 
+void BindingData::TraceTimer(const FunctionCallbackInfo<Value>& args) {
+  CHECK_EQ(args.Length(), 4);
+  CHECK(args[0]->IsInt32());
+  CHECK(args[1]->IsNumber());
+  CHECK(args[2]->IsNumber());
+  CHECK(args[3]->IsNumber());
+  const realm_time::ClockTraceKind kind =
+      args[0].As<Int32>()->Value() == 0
+          ? realm_time::ClockTraceKind::kTimerCreate
+          : realm_time::ClockTraceKind::kTimerFire;
+  realm_time::TraceClockRead(kind,
+                             uv_hrtime(),
+                             args[2].As<Number>()->Value(),
+                             args[1].As<Number>()->Value(),
+                             args[3].As<Number>()->Value());
+}
+
 void BindingData::CreatePerIsolateProperties(IsolateData* isolate_data,
                                              Local<ObjectTemplate> target) {
   Isolate* isolate = isolate_data->isolate();
@@ -143,6 +161,7 @@ void BindingData::CreatePerIsolateProperties(IsolateData* isolate_data,
   SetMethod(isolate, target, "setupTimers", SetupTimers);
   SetMethodNoSideEffect(
       isolate, target, "nestingClampEnabled", NestingClampEnabled);
+  SetMethod(isolate, target, "traceTimer", TraceTimer);
   SetFastMethod(
       isolate, target, "getLibuvNow", SlowGetLibuvNow, &fast_get_libuv_now_);
   SetFastMethod(isolate,
@@ -189,6 +208,7 @@ void BindingData::RegisterTimerExternalReferences(
     ExternalReferenceRegistry* registry) {
   registry->Register(SetupTimers);
   registry->Register(NestingClampEnabled);
+  registry->Register(TraceTimer);
 
   registry->Register(SlowGetLibuvNow);
   registry->Register(fast_get_libuv_now_);

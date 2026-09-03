@@ -188,6 +188,29 @@ bool TimerNestingClampEnabled();
 // malformed value fails at startup rather than at the first clock read.
 void InitializeClockSurface();
 
+// Clock trace: every target-observable clock read lands in one process-wide
+// ring buffer while tracing is on (RexMirror.clock.trace).  Records carry the
+// real uv_hrtime of the read, the value the caller saw and two kind-specific
+// extras; the ring overwrites the oldest record when full and counts drops.
+enum class ClockTraceKind : uint8_t {
+  kPerformanceNow = 0,  // value = returned ms
+  kDate = 1,            // value = returned epoch ms (Date.now / new Date)
+  kTimerCreate = 2,     // value = applied delay ms, aux0 = requested, aux1 = nesting
+  kTimerFire = 3,       // value = elapsed ms since scheduling, aux0 = scheduled delay, aux1 = nesting
+};
+void TraceClockRead(ClockTraceKind kind,
+                    uint64_t real_ns,
+                    double value,
+                    double aux0,
+                    double aux1);
+
+// Clock rules (RexMirror.clock.rules): constant shifts applied inside the
+// runtime so the observable shape stays consistent.  The performance.now
+// offset moves the absolute now before clamping, i.e. the page looks like it
+// has been open that much longer; the Date offset shifts every Date read.
+double PerformanceNowOffsetNanoseconds();
+double DateOffsetMilliseconds();
+
 void InstallTimeSourceCallback(v8::Isolate* isolate);
 void UninstallTimeSourceCallback(v8::Isolate* isolate);
 void RegisterExternalReferences(ExternalReferenceRegistry* registry);

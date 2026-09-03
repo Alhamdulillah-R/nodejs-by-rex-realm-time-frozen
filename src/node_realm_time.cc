@@ -44,7 +44,10 @@
 
 namespace node::realm_time {
 
+using v8::ArrayBuffer;
 using v8::Boolean;
+using v8::Float64Array;
+using v8::Uint8Array;
 using v8::Context;
 using v8::EscapableHandleScope;
 using v8::Exception;
@@ -706,6 +709,46 @@ struct ClockSurfaceState {
   uint64_t secret = 0;
 };
 
+// ---- clock trace ring ------------------------------------------------------
+struct ClockTraceRecord {
+  uint64_t seq;
+  uint64_t real_ns;
+  double value;
+  double aux0;
+  double aux1;
+  uint8_t kind;
+};
+
+struct ClockTraceState {
+  std::atomic<bool> enabled{false};
+  std::mutex mutex;
+  std::vector<ClockTraceRecord> ring;
+  size_t head = 0;   // next slot to write
+  size_t count = 0;  // live records
+  uint64_t next_seq = 0;
+  uint64_t dropped = 0;  // overwritten since the last drain
+  uint64_t total = 0;    // recorded since start
+  uint64_t start_ns = 0;
+};
+
+ClockTraceState& ClockTrace() {
+  static ClockTraceState state;
+  return state;
+}
+
+struct ClockRulesState {
+  std::atomic<double> performance_now_offset_ms{0};
+  std::atomic<double> date_offset_ms{0};
+};
+
+ClockRulesState& ClockRules() {
+  static ClockRulesState state;
+  return state;
+}
+
+constexpr size_t kClockTraceDefaultCapacity = 65536;
+constexpr size_t kClockTraceMaxCapacity = size_t{1} << 24;
+
 #ifdef _WIN32
 // Chrome raises the system timer through ntdll rather than winmm's
 // timeBeginPeriod; do the same so the effect (and its footprint) match.
@@ -1206,13 +1249,20 @@ uint64_t RealMonotonicTimeNanoseconds() {
 
 int64_t RealmDateNowCallback(Isolate* isolate, int64_t real_time_millis) {
   HandleScope handle_scope(isolate);
-  double result = CurrentWallTimeMilliseconds(real_time_millis);
+  double result =
+      CurrentWallTimeMilliseconds(real_time_millis) + DateOffsetMilliseconds();
   if (!std::isfinite(result) ||
       result < static_cast<double>(std::numeric_limits<int64_t>::min()) ||
       result > static_cast<double>(std::numeric_limits<int64_t>::max())) {
     return real_time_millis;
   }
-  return static_cast<int64_t>(std::floor(result));
+  const int64_t floored = static_cast<int64_t>(std::floor(result));
+  TraceClockRead(ClockTraceKind::kDate,
+                 uv_hrtime(),
+                 static_cast<double>(floored),
+                 0,
+                 0);
+  return floored;
 }
 
 RealmTimeController* ResolveController(
@@ -1559,6 +1609,221 @@ void AbortExternalCallBinding(const FunctionCallbackInfo<Value>& args) {
   args.GetReturnValue().Set(true);
 }
 
+Local<Object> ClockTraceStatsToObject(Environment* env) {
+  Isolate* isolate = env->isolate();
+  Local<Context> context = isolate->GetCurrentContext();
+  ClockTraceState& trace = ClockTrace();
+  std::lock_guard<std::mutex> lock(trace.mutex);
+  Local<Object> result = Object::New(isolate);
+  auto set = [&](const char* name, Local<Value> value) {
+    result->Set(context, OneByteString(isolate, name), value).Check();
+  };
+  set("enabled", Boolean::New(isolate, trace.enabled.load()));
+  set("capacity", Number::New(isolate, static_cast<double>(trace.ring.size())));
+  set("pending", Number::New(isolate, static_cast<double>(trace.count)));
+  set("dropped", Number::New(isolate, static_cast<double>(trace.dropped)));
+  set("total", Number::New(isolate, static_cast<double>(trace.total)));
+  return result;
+}
+
+// startClockTrace({ capacity? }): (re)initialises the ring and turns tracing
+// on.  A restart discards whatever was pending.
+void StartClockTraceBinding(const FunctionCallbackInfo<Value>& args) {
+  Environment* env = Environment::GetCurrent(args);
+  Isolate* isolate = env->isolate();
+  Local<Context> context = isolate->GetCurrentContext();
+  size_t capacity = kClockTraceDefaultCapacity;
+  if (args.Length() > 0 && !args[0]->IsUndefined()) {
+    if (!args[0]->IsObject()) {
+      env->ThrowTypeError("startClockTrace options must be an object");
+      return;
+    }
+    Local<Value> value;
+    if (!args[0].As<Object>()
+             ->Get(context, OneByteString(isolate, "capacity"))
+             .ToLocal(&value)) {
+      return;
+    }
+    if (!value->IsUndefined()) {
+      if (!value->IsNumber()) {
+        env->ThrowTypeError("capacity must be a number");
+        return;
+      }
+      const double requested = value.As<Number>()->Value();
+      if (!std::isfinite(requested) || requested < 1 ||
+          requested != std::floor(requested) ||
+          requested > static_cast<double>(kClockTraceMaxCapacity)) {
+        env->ThrowRangeError("capacity must be a whole number in 1..2^24");
+        return;
+      }
+      capacity = static_cast<size_t>(requested);
+    }
+  }
+  ClockTraceState& trace = ClockTrace();
+  {
+    std::lock_guard<std::mutex> lock(trace.mutex);
+    trace.ring.assign(capacity, ClockTraceRecord{});
+    trace.head = 0;
+    trace.count = 0;
+    trace.next_seq = 0;
+    trace.dropped = 0;
+    trace.total = 0;
+    trace.start_ns = uv_hrtime();
+    trace.enabled.store(true, std::memory_order_release);
+  }
+  args.GetReturnValue().Set(ClockTraceStatsToObject(env));
+}
+
+void StopClockTraceBinding(const FunctionCallbackInfo<Value>& args) {
+  Environment* env = Environment::GetCurrent(args);
+  ClockTrace().enabled.store(false, std::memory_order_release);
+  args.GetReturnValue().Set(ClockTraceStatsToObject(env));
+}
+
+void ClockTraceStatsBinding(const FunctionCallbackInfo<Value>& args) {
+  Environment* env = Environment::GetCurrent(args);
+  args.GetReturnValue().Set(ClockTraceStatsToObject(env));
+}
+
+// drainClockTrace(): moves every pending record out as columnar typed arrays
+// (seq, kind, realMs since trace start, value, aux0, aux1) and resets the
+// drop counter.  Columnar keeps a 65k drain cheap.
+void DrainClockTraceBinding(const FunctionCallbackInfo<Value>& args) {
+  Environment* env = Environment::GetCurrent(args);
+  Isolate* isolate = env->isolate();
+  Local<Context> context = isolate->GetCurrentContext();
+
+  std::vector<ClockTraceRecord> records;
+  uint64_t dropped = 0;
+  uint64_t total = 0;
+  uint64_t start_ns = 0;
+  {
+    ClockTraceState& trace = ClockTrace();
+    std::lock_guard<std::mutex> lock(trace.mutex);
+    records.reserve(trace.count);
+    const size_t capacity = trace.ring.size();
+    if (capacity != 0) {
+      size_t index = (trace.head + capacity - trace.count) % capacity;
+      for (size_t i = 0; i < trace.count; i++) {
+        records.push_back(trace.ring[index]);
+        index = (index + 1) % capacity;
+      }
+    }
+    dropped = trace.dropped;
+    total = trace.total;
+    start_ns = trace.start_ns;
+    trace.head = 0;
+    trace.count = 0;
+    trace.dropped = 0;
+  }
+
+  const size_t n = records.size();
+  auto make_f64 = [&](auto getter) {
+    Local<ArrayBuffer> buffer =
+        ArrayBuffer::New(isolate, n * sizeof(double));
+    double* data = static_cast<double*>(buffer->Data());
+    for (size_t i = 0; i < n; i++) data[i] = getter(records[i]);
+    return Float64Array::New(buffer, 0, n);
+  };
+  Local<ArrayBuffer> kind_buffer = ArrayBuffer::New(isolate, n);
+  uint8_t* kind_data = static_cast<uint8_t*>(kind_buffer->Data());
+  for (size_t i = 0; i < n; i++) kind_data[i] = records[i].kind;
+
+  Local<Object> result = Object::New(isolate);
+  auto set = [&](const char* name, Local<Value> value) {
+    result->Set(context, OneByteString(isolate, name), value).Check();
+  };
+  set("count", Number::New(isolate, static_cast<double>(n)));
+  set("seq", make_f64([](const ClockTraceRecord& r) {
+        return static_cast<double>(r.seq);
+      }));
+  set("kind", Uint8Array::New(kind_buffer, 0, n));
+  set("realMs", make_f64([start_ns](const ClockTraceRecord& r) {
+        return (static_cast<double>(r.real_ns) -
+                static_cast<double>(start_ns)) / 1e6;
+      }));
+  set("value", make_f64([](const ClockTraceRecord& r) { return r.value; }));
+  set("aux0", make_f64([](const ClockTraceRecord& r) { return r.aux0; }));
+  set("aux1", make_f64([](const ClockTraceRecord& r) { return r.aux1; }));
+  set("dropped", Number::New(isolate, static_cast<double>(dropped)));
+  set("total", Number::New(isolate, static_cast<double>(total)));
+  args.GetReturnValue().Set(result);
+}
+
+Local<Object> ClockRulesToObject(Environment* env) {
+  Isolate* isolate = env->isolate();
+  Local<Context> context = isolate->GetCurrentContext();
+  ClockRulesState& rules = ClockRules();
+  Local<Object> result = Object::New(isolate);
+  result
+      ->Set(context,
+            OneByteString(isolate, "performanceNowOffsetMs"),
+            Number::New(isolate, rules.performance_now_offset_ms.load()))
+      .Check();
+  result
+      ->Set(context,
+            OneByteString(isolate, "dateOffsetMs"),
+            Number::New(isolate, rules.date_offset_ms.load()))
+      .Check();
+  return result;
+}
+
+void GetClockRulesBinding(const FunctionCallbackInfo<Value>& args) {
+  Environment* env = Environment::GetCurrent(args);
+  args.GetReturnValue().Set(ClockRulesToObject(env));
+}
+
+// setClockRules({ performanceNowOffsetMs?, dateOffsetMs? }): undefined keeps
+// the current value; non-finite numbers throw.
+void SetClockRulesBinding(const FunctionCallbackInfo<Value>& args) {
+  Environment* env = Environment::GetCurrent(args);
+  Isolate* isolate = env->isolate();
+  Local<Context> context = isolate->GetCurrentContext();
+  if (args.Length() < 1 || !args[0]->IsObject()) {
+    env->ThrowTypeError("setClockRules requires an options object");
+    return;
+  }
+  Local<Object> options = args[0].As<Object>();
+  ClockRulesState& rules = ClockRules();
+  double performance_now_offset_ms = rules.performance_now_offset_ms.load();
+  double date_offset_ms = rules.date_offset_ms.load();
+  Local<Value> value;
+
+  if (!options->Get(context, OneByteString(isolate, "performanceNowOffsetMs"))
+           .ToLocal(&value)) {
+    return;
+  }
+  if (!value->IsUndefined()) {
+    if (!value->IsNumber()) {
+      env->ThrowTypeError("performanceNowOffsetMs must be a number");
+      return;
+    }
+    performance_now_offset_ms = value.As<Number>()->Value();
+    if (!std::isfinite(performance_now_offset_ms)) {
+      env->ThrowRangeError("performanceNowOffsetMs must be finite");
+      return;
+    }
+  }
+  if (!options->Get(context, OneByteString(isolate, "dateOffsetMs"))
+           .ToLocal(&value)) {
+    return;
+  }
+  if (!value->IsUndefined()) {
+    if (!value->IsNumber()) {
+      env->ThrowTypeError("dateOffsetMs must be a number");
+      return;
+    }
+    date_offset_ms = value.As<Number>()->Value();
+    if (!std::isfinite(date_offset_ms)) {
+      env->ThrowRangeError("dateOffsetMs must be finite");
+      return;
+    }
+  }
+  rules.performance_now_offset_ms.store(performance_now_offset_ms);
+  rules.date_offset_ms.store(date_offset_ms);
+  args.GetReturnValue().Set(ClockRulesToObject(env));
+}
+
 Local<Object> ClockSurfaceToObject(Environment* env,
                                    const ClockSurfaceSettings& settings) {
   Isolate* isolate = env->isolate();
@@ -1762,6 +2027,12 @@ void Initialize(Local<Object> target,
   SetMethod(context, target, "getExceptionRecords", GetExceptionRecordsBinding);
   SetMethod(context, target, "getClockSurface", GetClockSurfaceBinding);
   SetMethod(context, target, "setClockSurface", SetClockSurfaceBinding);
+  SetMethod(context, target, "startClockTrace", StartClockTraceBinding);
+  SetMethod(context, target, "stopClockTrace", StopClockTraceBinding);
+  SetMethod(context, target, "drainClockTrace", DrainClockTraceBinding);
+  SetMethod(context, target, "clockTraceStats", ClockTraceStatsBinding);
+  SetMethod(context, target, "getClockRules", GetClockRulesBinding);
+  SetMethod(context, target, "setClockRules", SetClockRulesBinding);
 }
 
 }  // namespace
@@ -2519,6 +2790,42 @@ void InitializeClockSurface() {
   ClockSurface();
 }
 
+void TraceClockRead(ClockTraceKind kind,
+                    uint64_t real_ns,
+                    double value,
+                    double aux0,
+                    double aux1) {
+  ClockTraceState& trace = ClockTrace();
+  if (!trace.enabled.load(std::memory_order_relaxed)) return;
+  std::lock_guard<std::mutex> lock(trace.mutex);
+  if (!trace.enabled.load(std::memory_order_relaxed) || trace.ring.empty()) {
+    return;
+  }
+  ClockTraceRecord& slot = trace.ring[trace.head];
+  if (trace.count == trace.ring.size()) {
+    trace.dropped++;
+  } else {
+    trace.count++;
+  }
+  slot = ClockTraceRecord{trace.next_seq++,
+                          real_ns,
+                          value,
+                          aux0,
+                          aux1,
+                          static_cast<uint8_t>(kind)};
+  trace.head = (trace.head + 1) % trace.ring.size();
+  trace.total++;
+}
+
+double PerformanceNowOffsetNanoseconds() {
+  return ClockRules().performance_now_offset_ms.load(
+             std::memory_order_relaxed) * 1e6;
+}
+
+double DateOffsetMilliseconds() {
+  return ClockRules().date_offset_ms.load(std::memory_order_relaxed);
+}
+
 ClockSurfaceSettings GetClockSurfaceSettings() {
   const ClockSurfaceConfig config = GetClockSurfaceConfig();
   return ClockSurfaceSettings{config.resolution_ns,
@@ -2591,6 +2898,12 @@ void RegisterExternalReferences(ExternalReferenceRegistry* registry) {
   registry->Register(EnableBinding);
   registry->Register(GetClockSurfaceBinding);
   registry->Register(SetClockSurfaceBinding);
+  registry->Register(StartClockTraceBinding);
+  registry->Register(StopClockTraceBinding);
+  registry->Register(DrainClockTraceBinding);
+  registry->Register(ClockTraceStatsBinding);
+  registry->Register(GetClockRulesBinding);
+  registry->Register(SetClockRulesBinding);
   registry->Register(DisableBinding);
   registry->Register(IsEnabledBinding);
   registry->Register(BeginExternalCallBinding);

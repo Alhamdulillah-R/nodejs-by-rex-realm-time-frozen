@@ -29,6 +29,9 @@ class BindingData : public SnapshotableObject {
   // never see the runtime environment.
   static void NestingClampEnabled(
       const v8::FunctionCallbackInfo<v8::Value>& args);
+  // traceTimer(kind, scheduledMs, appliedOrElapsedMs, nesting): feeds timer
+  // creation (kind 0) and firing (kind 1) into the clock trace ring.
+  static void TraceTimer(const v8::FunctionCallbackInfo<v8::Value>& args);
 
   static void SlowGetLibuvNow(const v8::FunctionCallbackInfo<v8::Value>& args);
   static double FastGetLibuvNow(v8::Local<v8::Value> receiver);

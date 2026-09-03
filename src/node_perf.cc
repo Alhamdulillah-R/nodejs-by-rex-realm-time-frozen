@@ -318,10 +318,16 @@ void MarkBootstrapComplete(const FunctionCallbackInfo<Value>& args) {
 
 static double PerformanceNowImpl(Isolate*) {
   const uint64_t real_now = uv_hrtime();
+  // The rule offset shifts the absolute now before clamping, so a page that
+  // "has been open longer" keeps the renderer's quantisation and float shape.
   const double observable_now =
-      realm_time::CurrentMonotonicTimeNanoseconds(real_now);
-  return realm_time::ObservableElapsedMilliseconds(
+      realm_time::CurrentMonotonicTimeNanoseconds(real_now) +
+      realm_time::PerformanceNowOffsetNanoseconds();
+  const double result = realm_time::ObservableElapsedMilliseconds(
       observable_now, static_cast<double>(performance_process_start));
+  realm_time::TraceClockRead(
+      realm_time::ClockTraceKind::kPerformanceNow, real_now, result, 0, 0);
+  return result;
 }
 
 static double FastPerformanceNow(v8::Local<v8::Value> receiver) {
