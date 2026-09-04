@@ -1,4 +1,5 @@
 #include "node_realm_time.h"
+#include "rexmirror_release.h"
 
 #include "env-inl.h"
 #include "ncrypto.h"
@@ -1865,6 +1866,36 @@ void GetClockSurfaceBinding(const FunctionCallbackInfo<Value>& args) {
       ClockSurfaceToObject(env, GetClockSurfaceSettings()));
 }
 
+// getReleaseInfo(): the release record compiled into this binary
+// (src/rexmirror_release.h), the same one `node --version` prints.
+void GetReleaseInfoBinding(const FunctionCallbackInfo<Value>& args) {
+  Environment* env = Environment::GetCurrent(args);
+  Isolate* isolate = env->isolate();
+  Local<Context> context = env->context();
+  Local<Object> result = Object::New(isolate);
+  result
+      ->Set(context,
+            OneByteString(isolate, "serial"),
+            Integer::New(isolate, REXMIRROR_RELEASE_SERIAL))
+      .Check();
+  result
+      ->Set(context,
+            OneByteString(isolate, "lyric"),
+            OneByteString(isolate, REXMIRROR_RELEASE_LYRIC))
+      .Check();
+  result
+      ->Set(context,
+            OneByteString(isolate, "song"),
+            OneByteString(isolate, REXMIRROR_RELEASE_SONG))
+      .Check();
+  result
+      ->Set(context,
+            OneByteString(isolate, "date"),
+            OneByteString(isolate, REXMIRROR_RELEASE_DATE))
+      .Check();
+  args.GetReturnValue().Set(result);
+}
+
 // setClockSurface({ resolutionNs?, nestingClamp?, timerGridMs? }): fields
 // left undefined keep their current value; anything else is validated here
 // so a bad call throws instead of silently doing nothing.
@@ -2028,6 +2059,7 @@ void Initialize(Local<Object> target,
             GetCodeGenerationRecordsBinding);
   SetMethod(context, target, "getExceptionRecords", GetExceptionRecordsBinding);
   SetMethod(context, target, "getClockSurface", GetClockSurfaceBinding);
+  SetMethod(context, target, "getReleaseInfo", GetReleaseInfoBinding);
   SetMethod(context, target, "setClockSurface", SetClockSurfaceBinding);
   SetMethod(context, target, "startClockTrace", StartClockTraceBinding);
   SetMethod(context, target, "stopClockTrace", StopClockTraceBinding);
@@ -2922,6 +2954,7 @@ void UninstallTimeSourceCallback(Isolate* isolate) {
 void RegisterExternalReferences(ExternalReferenceRegistry* registry) {
   registry->Register(EnableBinding);
   registry->Register(GetClockSurfaceBinding);
+  registry->Register(GetReleaseInfoBinding);
   registry->Register(SetClockSurfaceBinding);
   registry->Register(StartClockTraceBinding);
   registry->Register(StopClockTraceBinding);

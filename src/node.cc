@@ -46,6 +46,7 @@
 #include "node_snapshot_builder.h"
 #include "node_v8_platform-inl.h"
 #include "node_version.h"
+#include "rexmirror_release.h"
 #include "node_realm_time.h"
 
 #if HAVE_OPENSSL
@@ -1148,7 +1149,9 @@ InitializeOncePerProcessInternal(const std::vector<std::string>& args,
 
   if (!(flags & ProcessInitializationFlags::kNoPrintHelpOrVersionOutput)) {
     if (per_process::cli_options->print_version) {
-      printf("%s\n", NODE_VERSION);
+      // The RexMirror line is named by a lyric; the numeric version stays in
+      // process.version for tooling.
+      printf("%s\n", REXMIRROR_RELEASE_LYRIC);
       result->exit_code_ = ExitCode::kNoFailure;
       result->early_return_ = true;
       return result;

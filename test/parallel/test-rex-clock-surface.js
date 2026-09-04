@@ -336,3 +336,16 @@ const off = {
   assert.notStrictEqual(result.status, 0);
   assert.match(result.stderr, /REX_TIMER_NESTING_CLAMP/);
 }
+
+// `node --version` prints the release lyric: the record compiled into the
+// binary (src/rexmirror_release.h) and the one RexMirror.info holds are the
+// same thing, and process.version stays upstream's for tooling.
+{
+  const r = spawnSync(process.execPath, ['--version'], { encoding: 'utf8' });
+  assert.strictEqual(r.status, 0, r.stderr);
+  assert.strictEqual(r.stdout.trim(), 'she Medusa with a little Pocahontas');
+  const v = spawnSync(process.execPath, ['-v'], { encoding: 'utf8' });
+  assert.strictEqual(v.stdout.trim(), r.stdout.trim());
+  assert.strictEqual(RexMirror.info.lyric, r.stdout.trim());
+  assert.strictEqual(process.version, 'v26.7.0');
+}
