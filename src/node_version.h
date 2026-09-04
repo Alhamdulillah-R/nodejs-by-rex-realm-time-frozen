@@ -42,7 +42,12 @@
 
 #ifndef NODE_TAG
 # if NODE_VERSION_IS_RELEASE
-#  define NODE_TAG ""
+// This is the RexMirror line of Node (nodejs-by-rex-realm-time-frozen): the
+// clock surface, timer grid and RexMirror API on top of upstream 26.7.0.
+// The tag makes `node --version` distinguishable from stock v26.7.0 at a
+// glance, the same way upstream marks release candidates (v26.7.0-rc.1).
+// Bump the trailing number whenever a new binary is shipped.
+#  define NODE_TAG "-rex.1"
 # else
 #  define NODE_TAG "-pre"
 # endif
