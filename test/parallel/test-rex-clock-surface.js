@@ -114,6 +114,8 @@ const off = {
     const expectedChrome = RexMirror.clock.presets.chrome[host];
     const chromeWindows = RexMirror.clock.use('chrome', 'windows');
     const nodeWindows = RexMirror.clock.use('node', 'windows');
+    const winchromeWindows = RexMirror.clock.use('winchrome', 'windows');
+    const winchromeLinux = RexMirror.clock.use('winchrome', 'linux');
     let badPlatform = null;
     try { RexMirror.clock.use('chrome', 'mac'); } catch (e) { badPlatform = e.code; }
     RexMirror.clock.use('chrome');
@@ -136,6 +138,8 @@ const off = {
       before: pick(before), chrome: pick(chrome), idle,
       expectedChrome: pick(expectedChrome),
       chromeWindows: pick(chromeWindows), nodeWindows: pick(nodeWindows),
+      winchromeWindows: pick(winchromeWindows),
+      winchromeLinux: pick(winchromeLinux),
       badPlatform,
       platformResolutionIsNumber: typeof chrome.platformTimerResolutionMs === 'number',
       offGrid: v.filter((x) => !onGrid(x)).length,
@@ -158,6 +162,16 @@ const off = {
   });
   assert.deepStrictEqual(r.nodeWindows, {
     resolutionNs: 100, nestingClamp: false, timerGridMs: 15.625,
+    highResolutionTimer: false,
+  });
+  // winchrome: same grid on both hosts; only the Windows variant takes over
+  // the system timer so the OS tick cannot round on top of the grid.
+  assert.deepStrictEqual(r.winchromeWindows, {
+    resolutionNs: 100000, nestingClamp: true, timerGridMs: 15.625,
+    highResolutionTimer: true,
+  });
+  assert.deepStrictEqual(r.winchromeLinux, {
+    resolutionNs: 100000, nestingClamp: true, timerGridMs: 15.625,
     highResolutionTimer: false,
   });
   assert.strictEqual(r.badPlatform, 'ERR_INVALID_ARG_VALUE');
