@@ -116,6 +116,7 @@ const off = {
     const nodeWindows = RexMirror.clock.use('node', 'windows');
     const winchromeWindows = RexMirror.clock.use('winchrome', 'windows');
     const winchromeLinux = RexMirror.clock.use('winchrome', 'linux');
+    const info = RexMirror.info;
     let badPlatform = null;
     try { RexMirror.clock.use('chrome', 'mac'); } catch (e) { badPlatform = e.code; }
     RexMirror.clock.use('chrome');
@@ -140,6 +141,14 @@ const off = {
       chromeWindows: pick(chromeWindows), nodeWindows: pick(nodeWindows),
       winchromeWindows: pick(winchromeWindows),
       winchromeLinux: pick(winchromeLinux),
+      info: {
+        serial: info.serial, lyric: info.lyric, song: info.song, date: info.date,
+        node: info.node, banner: info.banner, releases: info.releases.length,
+        frozen: Object.isFrozen(info) && Object.isFrozen(info.releases) &&
+          info.releases.every((r) => Object.isFrozen(r) && Object.isFrozen(r.changes)),
+        last: info.releases[info.releases.length - 1].lyric,
+      },
+      version: process.version,
       badPlatform,
       platformResolutionIsNumber: typeof chrome.platformTimerResolutionMs === 'number',
       offGrid: v.filter((x) => !onGrid(x)).length,
@@ -174,6 +183,19 @@ const off = {
     resolutionNs: 100000, nestingClamp: true, timerGridMs: 15.625,
     highResolutionTimer: false,
   });
+  // Release record: named by a lyric, `node --version` stays upstream's.
+  assert.strictEqual(r.version, 'v26.7.0');
+  assert.strictEqual(r.info.serial, 1);
+  assert.strictEqual(r.info.lyric, 'she Medusa with a little Pocahontas');
+  assert.strictEqual(r.info.song, 'Wasted');
+  assert.strictEqual(r.info.date, '2026-09-04');
+  assert.strictEqual(r.info.node, '26.7.0');
+  assert.strictEqual(r.info.last, r.info.lyric);
+  assert.ok(r.info.releases >= 1);
+  assert.strictEqual(r.info.frozen, true);
+  assert.strictEqual(
+    r.info.banner,
+    'RexMirror #1 "she Medusa with a little Pocahontas" (Wasted) on Node 26.7.0, 2026-09-04');
   assert.strictEqual(r.badPlatform, 'ERR_INVALID_ARG_VALUE');
   assert.strictEqual(r.platformResolutionIsNumber, true);
   assert.strictEqual(r.idle, 0);
