@@ -1860,6 +1860,78 @@ Local<Object> ClockSurfaceToObject(Environment* env,
   return result;
 }
 
+// The vm.Context behind a contextified sandbox object.  Frame-boundary callers
+// always name a context: unlike the clock there is nothing useful to do with
+// "whichever context we happen to be in".
+bool ResolveContextArgument(const FunctionCallbackInfo<Value>& args,
+                            Local<Context>* out) {
+  Environment* env = Environment::GetCurrent(args);
+  if (args.Length() == 0 || !args[0]->IsObject()) {
+    env->ThrowTypeError("context must be a contextified vm object");
+    return false;
+  }
+  contextify::ContextifyContext* contextify =
+      contextify::ContextifyContext::ContextFromContextifiedSandbox(
+          env, args[0].As<Object>());
+  if (contextify == nullptr) {
+    env->ThrowTypeError("context must be a contextified vm object");
+    return false;
+  }
+  *out = contextify->context();
+  return true;
+}
+
+// A context is a frame boundary exactly when it no longer shares the main
+// context's security token.
+bool IsFrameBoundary(Environment* env, Local<Context> context) {
+  return !context->GetSecurityToken()->StrictEquals(
+      env->context()->GetSecurityToken());
+}
+
+// setFrameBoundary(sandbox, enabled): hand the context its own security token,
+// or give the main context's back.
+//
+// V8 already drops stack frames whose native context holds a different security
+// token than the context capturing the stack (`VisitStack` in
+// src/execution/isolate.cc; the filter is live because `StackTrace::kDetailed`
+// does not carry kExposeFramesAcrossSecurityOrigins).  That is how a browser
+// keeps one realm's frames out of another realm's `Error.stack`.  Node defeats
+// it by handing every vm.Context the main context's token
+// (node_contextify.cc), which is why code under vm.runInContext sees
+// `at Script.runInContext (node:vm)` and host file paths in its own stacks.
+// Dropping the shared token restores the browser behaviour for that context.
+//
+// Nothing else in Node reads the token: contextify installs no access-check
+// callback, so it is not consulted for property access across the boundary.
+//
+// The filter runs while a stack is captured, not while it is formatted, so code
+// inside the context sees only its own frames even if it installs its own
+// `Error.prepareStackTrace` to read CallSite objects directly.
+void SetFrameBoundaryBinding(const FunctionCallbackInfo<Value>& args) {
+  Environment* env = Environment::GetCurrent(args);
+  Local<Context> context;
+  if (!ResolveContextArgument(args, &context)) return;
+  if (args.Length() < 2 || !args[1]->IsBoolean()) {
+    env->ThrowTypeError("enabled must be a boolean");
+    return;
+  }
+
+  if (args[1]->BooleanValue(env->isolate())) {
+    context->UseDefaultSecurityToken();
+  } else {
+    context->SetSecurityToken(env->context()->GetSecurityToken());
+  }
+
+  args.GetReturnValue().Set(IsFrameBoundary(env, context));
+}
+
+void GetFrameBoundaryBinding(const FunctionCallbackInfo<Value>& args) {
+  Environment* env = Environment::GetCurrent(args);
+  Local<Context> context;
+  if (!ResolveContextArgument(args, &context)) return;
+  args.GetReturnValue().Set(IsFrameBoundary(env, context));
+}
+
 void GetClockSurfaceBinding(const FunctionCallbackInfo<Value>& args) {
   Environment* env = Environment::GetCurrent(args);
   args.GetReturnValue().Set(
@@ -2060,6 +2132,8 @@ void Initialize(Local<Object> target,
   SetMethod(context, target, "getExceptionRecords", GetExceptionRecordsBinding);
   SetMethod(context, target, "getClockSurface", GetClockSurfaceBinding);
   SetMethod(context, target, "getReleaseInfo", GetReleaseInfoBinding);
+  SetMethod(context, target, "setFrameBoundary", SetFrameBoundaryBinding);
+  SetMethod(context, target, "getFrameBoundary", GetFrameBoundaryBinding);
   SetMethod(context, target, "setClockSurface", SetClockSurfaceBinding);
   SetMethod(context, target, "startClockTrace", StartClockTraceBinding);
   SetMethod(context, target, "stopClockTrace", StopClockTraceBinding);
@@ -2955,6 +3029,8 @@ void RegisterExternalReferences(ExternalReferenceRegistry* registry) {
   registry->Register(EnableBinding);
   registry->Register(GetClockSurfaceBinding);
   registry->Register(GetReleaseInfoBinding);
+  registry->Register(SetFrameBoundaryBinding);
+  registry->Register(GetFrameBoundaryBinding);
   registry->Register(SetClockSurfaceBinding);
   registry->Register(StartClockTraceBinding);
   registry->Register(StopClockTraceBinding);

@@ -194,6 +194,19 @@ ContextifyContext::ContextifyContext(Environment* env,
       EmbedderDataTag::kPerContextData);
 }
 
+// V8 access-checks every JSGlobalProxy.  Contexts sharing a security token
+// clear the check on the token comparison alone, which is every vm.Context
+// until RexMirror.stack.setFrameBoundary hands one its own token so that V8
+// keeps host frames out of the stacks that context captures.  Once the tokens
+// differ Isolate::MayAccess denies outright unless a callback says otherwise,
+// and vm has never been a security boundary between host and sandbox, so the
+// answer here is always yes.
+bool ContextifyContext::AccessCheckAlwaysAllow(v8::Local<v8::Context>,
+                                               v8::Local<v8::Object>,
+                                               v8::Local<v8::Value>) {
+  return true;
+}
+
 void ContextifyContext::InitializeGlobalTemplates(IsolateData* isolate_data) {
   DCHECK(isolate_data->contextify_wrapper_template().IsEmpty());
   Local<FunctionTemplate> global_func_template =
@@ -225,6 +238,7 @@ void ContextifyContext::InitializeGlobalTemplates(IsolateData* isolate_data) {
       {},
       flags);
 
+  global_object_template->SetAccessCheckCallback(AccessCheckAlwaysAllow);
   global_object_template->SetHandler(config);
   global_object_template->SetHandler(indexed_config);
   isolate_data->set_contextify_global_template(global_object_template);
@@ -394,6 +408,7 @@ void ContextifyContext::CreatePerIsolateProperties(
 void ContextifyContext::RegisterExternalReferences(
     ExternalReferenceRegistry* registry) {
   registry->Register(MakeContext);
+  registry->Register(AccessCheckAlwaysAllow);
   registry->Register(PropertyQueryCallback);
   registry->Register(PropertyGetterCallback);
   registry->Register(PropertySetterCallback);

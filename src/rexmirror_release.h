@@ -10,9 +10,9 @@
 // (with its change list) to `releases` in lib/internal/bootstrap/node.js,
 // rebuild both hosts, tag release/<serial>-<slug>.  Bootstrap refuses to
 // start when the two records disagree.
-#define REXMIRROR_RELEASE_SERIAL 1
-#define REXMIRROR_RELEASE_LYRIC "she Medusa with a little Pocahontas"
-#define REXMIRROR_RELEASE_SONG "Wasted"
-#define REXMIRROR_RELEASE_DATE "2026-09-04"
+#define REXMIRROR_RELEASE_SERIAL 2
+#define REXMIRROR_RELEASE_LYRIC "She was more like a beauty queen from a movie scene"
+#define REXMIRROR_RELEASE_SONG "Billie Jean"
+#define REXMIRROR_RELEASE_DATE "2026-09-05"
 
 #endif  // SRC_REXMIRROR_RELEASE_H_

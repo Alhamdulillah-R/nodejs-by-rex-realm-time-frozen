@@ -135,6 +135,9 @@ class ContextifyContext final : CPPGC_MIXIN(ContextifyContext) {
   static ContextifyContext* Get(v8::Local<v8::Object> object);
 
   static void InitializeGlobalTemplates(IsolateData* isolate_data);
+  static bool AccessCheckAlwaysAllow(v8::Local<v8::Context> accessing_context,
+                                     v8::Local<v8::Object> accessed_object,
+                                     v8::Local<v8::Value> data);
 
  private:
   static ContextifyContext* New(Environment* env,

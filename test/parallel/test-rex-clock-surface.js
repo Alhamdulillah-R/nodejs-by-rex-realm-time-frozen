@@ -183,19 +183,22 @@ const off = {
     resolutionNs: 100000, nestingClamp: true, timerGridMs: 15.625,
     highResolutionTimer: false,
   });
-  // Release record: named by a lyric, `node --version` stays upstream's.
+  // Release record.  The lyric changes with every shipped binary, so pin the
+  // shape rather than the words: the current release is the last entry, the
+  // banner is built from it, and process.version stays upstream's.
   assert.strictEqual(r.version, 'v26.7.0');
-  assert.strictEqual(r.info.serial, 1);
-  assert.strictEqual(r.info.lyric, 'she Medusa with a little Pocahontas');
-  assert.strictEqual(r.info.song, 'Wasted');
-  assert.strictEqual(r.info.date, '2026-09-04');
   assert.strictEqual(r.info.node, '26.7.0');
+  assert.ok(r.info.serial >= 1);
+  assert.strictEqual(r.info.releases, r.info.serial);
   assert.strictEqual(r.info.last, r.info.lyric);
-  assert.ok(r.info.releases >= 1);
+  assert.match(r.info.date, /^\d{4}-\d{2}-\d{2}$/);
+  assert.ok(r.info.lyric.length > 0);
+  assert.ok(r.info.song.length > 0);
   assert.strictEqual(r.info.frozen, true);
   assert.strictEqual(
     r.info.banner,
-    'RexMirror #1 "she Medusa with a little Pocahontas" (Wasted) on Node 26.7.0, 2026-09-04');
+    `RexMirror #${r.info.serial} "${r.info.lyric}" (${r.info.song}) ` +
+      `on Node ${r.info.node}, ${r.info.date}`);
   assert.strictEqual(r.badPlatform, 'ERR_INVALID_ARG_VALUE');
   assert.strictEqual(r.platformResolutionIsNumber, true);
   assert.strictEqual(r.idle, 0);
@@ -343,9 +346,8 @@ const off = {
 {
   const r = spawnSync(process.execPath, ['--version'], { encoding: 'utf8' });
   assert.strictEqual(r.status, 0, r.stderr);
-  assert.strictEqual(r.stdout.trim(), 'she Medusa with a little Pocahontas');
+  assert.strictEqual(r.stdout.trim(), RexMirror.info.lyric);
   const v = spawnSync(process.execPath, ['-v'], { encoding: 'utf8' });
   assert.strictEqual(v.stdout.trim(), r.stdout.trim());
-  assert.strictEqual(RexMirror.info.lyric, r.stdout.trim());
   assert.strictEqual(process.version, 'v26.7.0');
 }
