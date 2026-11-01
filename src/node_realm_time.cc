@@ -972,6 +972,28 @@ void CloseNativeSocket(NativeSocket socket) {
 #endif
 }
 
+/**
+ * Last socket error code: WSAGetLastError on Windows, errno elsewhere.
+ */
+int LastSocketError() {
+#ifdef _WIN32
+  return WSAGetLastError();
+#else
+  return errno;
+#endif
+}
+
+/**
+ * Throws message suffixed with the last socket error code.
+ */
+void ThrowSocketError(Environment* env, const char* message) {
+  std::string text(message);
+  text.append(" (socket error ")
+      .append(std::to_string(LastSocketError()))
+      .append(")");
+  env->ThrowError(text.c_str());
+}
+
 bool SendAll(NativeSocket socket, std::string_view data) {
   while (!data.empty()) {
 #ifdef MSG_NOSIGNAL
@@ -1110,7 +1132,7 @@ bool PerformControllerPost(Environment* env,
                             ControllerHttpResponse* result) {
   NativeSocket socket_handle = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
   if (socket_handle == kInvalidSocket) {
-    env->ThrowError("failed to create Controller socket");
+    ThrowSocketError(env, "failed to create Controller socket");
     return false;
   }
 
@@ -1121,8 +1143,23 @@ bool PerformControllerPost(Environment* env,
   if (connect(socket_handle,
               reinterpret_cast<const sockaddr*>(&address),
               sizeof(address)) != 0) {
+    ThrowSocketError(env, "failed to connect to the loopback Controller");
     CloseNativeSocket(socket_handle);
-    env->ThrowError("failed to connect to the loopback Controller");
+    return false;
+  }
+
+  // One connection per query: a graceful close would leave TIME_WAIT on an
+  // ephemeral port each time and exhaust the dynamic port range.
+  linger abortive_close{};
+  abortive_close.l_onoff = 1;
+  abortive_close.l_linger = 0;
+  if (setsockopt(socket_handle,
+                 SOL_SOCKET,
+                 SO_LINGER,
+                 reinterpret_cast<const char*>(&abortive_close),
+                 sizeof(abortive_close)) != 0) {
+    ThrowSocketError(env, "failed to set SO_LINGER on the Controller socket");
+    CloseNativeSocket(socket_handle);
     return false;
   }
 
@@ -1155,8 +1192,8 @@ bool PerformControllerPost(Environment* env,
       .append(body);
 
   if (!SendAll(socket_handle, request)) {
+    ThrowSocketError(env, "failed to send the parked Controller request");
     CloseNativeSocket(socket_handle);
-    env->ThrowError("failed to send the parked Controller request");
     return false;
   }
 
@@ -1166,8 +1203,8 @@ bool PerformControllerPost(Environment* env,
     int received = recv(socket_handle, buffer, sizeof(buffer), 0);
     if (received == 0) break;
     if (received < 0) {
+      ThrowSocketError(env, "failed to receive the Controller response");
       CloseNativeSocket(socket_handle);
-      env->ThrowError("failed to receive the Controller response");
       return false;
     }
     if (response.size() > kMaxControllerResponseBytes + 64 * 1024 - received) {
