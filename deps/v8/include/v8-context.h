@@ -68,6 +68,13 @@ class V8_EXPORT Context : public Data {
   void DetachGlobal();
 
   /**
+   * Makes the prototype of the global object immutable from now on, like the
+   * prototype of a browser [Global] such as Window. Setting it to its current
+   * value still succeeds.
+   */
+  void SetImmutableGlobalPrototype();
+
+  /**
    * Creates a new context and returns a handle to the newly allocated
    * context.
    *

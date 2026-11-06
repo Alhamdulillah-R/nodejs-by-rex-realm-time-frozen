@@ -490,6 +490,8 @@ extern enum MessageTemplate {
   kProxyIsExtensibleInconsistent,
   kProxyPreventExtensionsExtensible,
   kProxyTrapReturnedFalsish,
+  kJanusProxyTrapReturnedFalsish,
+  kJanusProxyTrapReturnedFalsishFor,
   kProxyGetPrototypeOfInvalid,
   kProxyGetPrototypeOfNonExtensible,
   kProxySetPrototypeOfNonExtensible,

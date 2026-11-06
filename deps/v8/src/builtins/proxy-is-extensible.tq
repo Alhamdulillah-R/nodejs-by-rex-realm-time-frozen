@@ -32,6 +32,13 @@ transitioning builtin ProxyIsExtensible(
     // target»)).
     const trapResult = ToBoolean(Call(context, trap, handler, target));
 
+    // Janus proxies: the trap result is authoritative; skip the invariant
+    // against the target (same as objects.cc JSProxy::IsExtensible).
+    // Both directions follow the trap.
+    if ((proxy.flags & kIsJanus) != 0) {
+      return SelectBooleanConstant(trapResult);
+    }
+
     // 8. Let targetResult be ? IsExtensible(target).
     const targetResult: bool =
         ToBoolean(object::ObjectIsExtensibleImpl(target));

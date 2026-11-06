@@ -839,6 +839,14 @@ class V8_EXPORT Isolate {
   void SetPrepareStackTraceCallback(PrepareStackTraceCallback callback);
 
   /**
+   * RexMirror: 引擎自己生成的错误 (ErrorUtils::MakeGenericError 路径, 例如 Proxy 不变式、Cyclic __proto__)
+   * 构造完成后回调一次。template_text 是 MessageTemplate 的原文 (参数未替换)。回调里可以改 error 的 message / stack。
+   */
+  using ErrorCreatedCallback = void (*)(Isolate* isolate, Local<Value> error,
+                                        const char* template_text);
+  void SetErrorCreatedCallback(ErrorCreatedCallback callback);
+
+  /**
    * Get the stackTraceLimit property of Error.
    */
   int GetStackTraceLimit();

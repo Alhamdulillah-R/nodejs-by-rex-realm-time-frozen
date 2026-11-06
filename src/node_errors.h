@@ -102,6 +102,7 @@ void OOMErrorHandler(const char* location, const v8::OOMDetails& details);
   V(ERR_INVALID_INVOCATION, TypeError)                                         \
   V(ERR_INVALID_PACKAGE_CONFIG, Error)                                         \
   V(ERR_INVALID_OBJECT_DEFINE_PROPERTY, TypeError)                             \
+  V(ERR_INVALID_RETURN_VALUE, TypeError)                                       \
   V(ERR_INVALID_MODULE, Error)                                                 \
   V(ERR_INVALID_STATE, Error)                                                  \
   V(ERR_INVALID_THIS, TypeError)                                               \
@@ -139,6 +140,9 @@ void OOMErrorHandler(const char* location, const v8::OOMDetails& details);
 // formatter on the message, and allow the caller to pass in a message
 // directly with characters that would otherwise need escaping if used
 // as format string unconditionally.
+// RexMirror: THROW_ERR_* 生成的错误都经过这里 (实现见 node_errors.cc), 调用 RexMirror.native.getErrorHook()(err, code)
+void RexApplyErrorHook(v8::Isolate* isolate, v8::Local<v8::Object> err, const char* code);
+
 #define V(code, type)                                                          \
   template <typename... Args>                                                  \
   inline v8::Local<v8::Object> code(                                           \
@@ -163,6 +167,7 @@ void OOMErrorHandler(const char* location, const v8::OOMDetails& details);
            FIXED_ONE_BYTE_STRING(isolate, "code"),                             \
            js_code)                                                            \
         .Check();                                                              \
+    RexApplyErrorHook(isolate, e, #code);                             \
     return e;                                                                  \
   }                                                                            \
   template <typename... Args>                                                  \

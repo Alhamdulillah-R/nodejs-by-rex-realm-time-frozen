@@ -77,6 +77,7 @@
   V(process_methods)                                                           \
   V(realm_time)                                                                \
   V(report)                                                                    \
+  V(rex_native)                                                                \
   V(sea)                                                                       \
   V(serdes)                                                                    \
   V(signal_wrap)                                                               \

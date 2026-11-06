@@ -5363,6 +5363,18 @@ Maybe<bool> JSObject::SetPrototype(Isolate* isolate,
   DirectHandle<JSPrototype> value;
   if (!TryCast(value_obj, &value)) return Just(true);
 
+  // Prototype cycles: it is sufficient to validate that the receiver is not in
+  // the new prototype chain. Janus proxies on that chain are walked through
+  // their getPrototypeOf trap, which runs JS, so the walk happens before any
+  // map of {object} is read; a cycle is reported after the checks below.
+  bool cycle = false;
+  if (IsJSReceiver(*value)) {
+    Maybe<bool> found = JSProxy::JanusChainContains(
+        isolate, Cast<JSReceiver>(value), object);
+    MAYBE_RETURN(found, Nothing<bool>());
+    cycle = found.FromJust();
+  }
+
   bool all_extensible = object->map()->is_extensible();
   DirectHandle<JSObject> real_receiver = object;
   if (from_javascript) {
@@ -5407,18 +5419,9 @@ Maybe<bool> JSObject::SetPrototype(Isolate* isolate,
                    NewTypeError(MessageTemplate::kNonExtensibleProto, object));
   }
 
-  // Before we can set the prototype we need to be sure prototype cycles are
-  // prevented.  It is sufficient to validate that the receiver is not in the
-  // new prototype chain.
-  if (Tagged<JSReceiver> receiver; TryCast<JSReceiver>(*value, &receiver)) {
-    for (PrototypeIterator iter(isolate, receiver, kStartAtReceiver);
-         !iter.IsAtEnd(); iter.Advance()) {
-      if (iter.GetCurrent<JSReceiver>() == *object) {
-        // Cycle detected.
-        RETURN_FAILURE(isolate, should_throw,
-                       NewTypeError(MessageTemplate::kCyclicProto));
-      }
-    }
+  if (cycle) {
+    RETURN_FAILURE(isolate, should_throw,
+                   NewTypeError(MessageTemplate::kCyclicProto));
   }
 
   // Set the new prototype of the object.

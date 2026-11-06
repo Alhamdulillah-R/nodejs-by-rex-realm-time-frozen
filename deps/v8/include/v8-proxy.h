@@ -32,6 +32,19 @@ class V8_EXPORT Proxy : public Object {
                                Local<Object> local_target,
                                Local<Object> local_handler);
 
+  /**
+   * Creates a Janus proxy: trap results are not checked against the target,
+   * and prototype cycle checks walk through it via the target.
+   */
+  static MaybeLocal<Proxy> NewJanus(Local<Context> context,
+                                    Local<Object> local_target,
+                                    Local<Object> local_handler);
+
+  /**
+   * Whether this proxy was created by NewJanus.
+   */
+  bool IsJanus() const;
+
   V8_INLINE static Proxy* Cast(Value* value) {
 #ifdef V8_ENABLE_CHECKS
     CheckCast(value);

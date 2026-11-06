@@ -7174,6 +7174,21 @@ void Context::DetachGlobal() {
   i_isolate->DetachGlobal(context);
 }
 
+void Context::SetImmutableGlobalPrototype() {
+  auto context = Utils::OpenDirectHandle(this);
+  i::Isolate* i_isolate = i::Isolate::Current();
+  EnterV8NoScriptNoExceptionScope api_scope(i_isolate);
+  i::DirectHandle<i::JSGlobalObject> global(context->global_object(),
+                                            i_isolate);
+  i::DirectHandle<i::Map> map(global->map(), i_isolate);
+  if (map->is_immutable_proto()) return;
+
+  // Copy + migrate, as Object.preventExtensions does for dictionary objects
+  i::DirectHandle<i::Map> new_map =
+      i::Map::TransitionToImmutableProto(i_isolate, map);
+  i::JSObject::MigrateToMap(i_isolate, global, new_map);
+}
+
 Local<v8::Object> Context::GetExtrasBindingObject() {
   auto context = Utils::OpenDirectHandle(this);
   i::Isolate* i_isolate = i::Isolate::Current();
@@ -8781,6 +8796,10 @@ bool Proxy::IsRevoked() const {
   return Utils::OpenDirectHandle(this)->IsRevoked();
 }
 
+bool Proxy::IsJanus() const {
+  return Utils::OpenDirectHandle(this)->is_janus();
+}
+
 void Proxy::Revoke() {
   auto self = Utils::OpenDirectHandle(this);
   i::JSProxy::Revoke(self);
@@ -8797,6 +8816,23 @@ MaybeLocal<Proxy> Proxy::New(Local<Context> context, Local<Object> local_target,
   bool api_proxies_assumed_revocable = true;
   return api_scope.EscapeMaybe(i::JSProxy::New(i_isolate, target, handler,
                                                api_proxies_assumed_revocable));
+}
+
+MaybeLocal<Proxy> Proxy::NewJanus(Local<Context> context,
+                                  Local<Object> local_target,
+                                  Local<Object> local_handler) {
+  PrepareForExecutionScope api_scope{context, RCCId::kAPI_Proxy_New};
+  i::Isolate* i_isolate = api_scope.i_isolate();
+  auto target = Utils::OpenDirectHandle(*local_target);
+  auto handler = Utils::OpenDirectHandle(*local_handler);
+  // Revocable like every API proxy, which also keeps TurboFan from inlining
+  // its traps.
+  i::DirectHandle<i::JSProxy> proxy;
+  if (!i::JSProxy::New(i_isolate, target, handler, true).ToHandle(&proxy)) {
+    return {};
+  }
+  proxy->set_flags(proxy->flags() | i::JSProxy::IsJanusBit::encode(true));
+  return api_scope.Escape(Utils::ToLocal(proxy));
 }
 
 CompiledWasmModule::CompiledWasmModule(
@@ -10235,6 +10271,11 @@ void Isolate::SetHostCreateShadowRealmContextCallback(
 void Isolate::SetPrepareStackTraceCallback(PrepareStackTraceCallback callback) {
   i::Isolate* i_isolate = reinterpret_cast<i::Isolate*>(this);
   i_isolate->SetPrepareStackTraceCallback(callback);
+}
+
+void Isolate::SetErrorCreatedCallback(ErrorCreatedCallback callback) {
+  i::Isolate* i_isolate = reinterpret_cast<i::Isolate*>(this);
+  i_isolate->SetErrorCreatedCallback(callback);
 }
 
 int Isolate::GetStackTraceLimit() {

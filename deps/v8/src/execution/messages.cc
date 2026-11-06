@@ -747,9 +747,40 @@ Handle<JSObject> ErrorUtils::MakeGenericError(
   DirectHandle<Object> no_caller;
   // The call below can't fail because constructor is a builtin.
   DCHECK(constructor->shared()->HasBuiltinId());
-  return ErrorUtils::Construct(isolate, constructor, constructor, msg, options,
-                               mode, no_caller, StackTraceCollection::kEnabled)
-      .ToHandleChecked();
+  Handle<JSObject> error =
+      ErrorUtils::Construct(isolate, constructor, constructor, msg, options,
+                            mode, no_caller, StackTraceCollection::kEnabled)
+          .ToHandleChecked();
+  // RexMirror: 引擎自己生成的错误创建完后回调 (node 侧转给 RexMirror.native.getErrorHook)
+  // Janus 的 falsish 和普通 Proxy 的 falsish 文本相同, 回调拿到的 key 用 template 名区分, 其余仍是 template 原文
+  const char* hook_key;
+  if (index == MessageTemplate::kJanusProxyTrapReturnedFalsish) {
+    hook_key = "JanusProxyTrapReturnedFalsish";
+  } else if (index == MessageTemplate::kJanusProxyTrapReturnedFalsishFor) {
+    hook_key = "JanusProxyTrapReturnedFalsishFor";
+  } else {
+    hook_key = MessageFormatter::TemplateString(index);
+  }
+  isolate->RunErrorCreatedCallback(error, hook_key);
+  return error;
+}
+
+// RexMirror: 调用 v8::Isolate::SetErrorCreatedCallback 注册的回调; 回调里再产生的引擎错误不再回调 (重入保护)
+void Isolate::RunErrorCreatedCallback(Handle<JSObject> error,
+                                      const char* template_text) {
+  if (error_created_callback_ == nullptr || running_error_created_callback_) return;
+  // 栈已耗尽 (例如 Isolate::StackOverflow 正在建 RangeError) 时不进 JS, 否则会再次溢出
+  if (StackLimitCheck(this).HasOverflowed()) return;
+  // 已有 pending exception 时不能再调用 JS (Execution 不允许), 也不能覆盖原来的异常
+  if (has_exception()) return;
+  // DisallowJavascriptExecution / ThrowOnJavascriptExecution 作用域内 (snapshot 等) 不执行 JS
+  if (!javascript_execution_assert() || !javascript_execution_throws()) return;
+  running_error_created_callback_ = true;
+  v8::Isolate* v8_isolate = reinterpret_cast<v8::Isolate*>(this);
+  v8::HandleScope handle_scope(v8_isolate);
+  v8::Local<v8::Value> value = v8::Utils::ToLocal(error);
+  error_created_callback_(v8_isolate, value, template_text);
+  running_error_created_callback_ = false;
 }
 
 // static

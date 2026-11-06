@@ -2037,6 +2037,11 @@ class V8_EXPORT_PRIVATE Isolate final : private HiddenFactory {
 #endif  // V8_OS_WIN64
 
   void SetPrepareStackTraceCallback(PrepareStackTraceCallback callback);
+  // RexMirror: 引擎错误回调 (见 v8-isolate.h SetErrorCreatedCallback); 运行体在 messages.cc
+  void SetErrorCreatedCallback(v8::Isolate::ErrorCreatedCallback callback) {
+    error_created_callback_ = callback;
+  }
+  void RunErrorCreatedCallback(Handle<JSObject> error, const char* template_text);
   MaybeDirectHandle<Object> RunPrepareStackTraceCallback(
       DirectHandle<NativeContext>, DirectHandle<JSObject> Error,
       DirectHandle<JSArray> sites);
@@ -2864,6 +2869,9 @@ class V8_EXPORT_PRIVATE Isolate final : private HiddenFactory {
   EmbeddedFileWriterInterface* embedded_file_writer_ = nullptr;
 
   PrepareStackTraceCallback prepare_stack_trace_callback_ = nullptr;
+  // RexMirror: 引擎错误回调 + 重入保护
+  v8::Isolate::ErrorCreatedCallback error_created_callback_ = nullptr;
+  bool running_error_created_callback_ = false;
 
 #if defined(V8_ENABLE_ETW_STACK_WALKING)
   FilterETWSessionByURLCallback filter_etw_session_by_url_callback_ = nullptr;

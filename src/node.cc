@@ -1150,8 +1150,11 @@ InitializeOncePerProcessInternal(const std::vector<std::string>& args,
   if (!(flags & ProcessInitializationFlags::kNoPrintHelpOrVersionOutput)) {
     if (per_process::cli_options->print_version) {
       // The RexMirror line is named by a lyric; the numeric version stays in
-      // process.version for tooling.
-      printf("%s\n", REXMIRROR_RELEASE_LYRIC);
+      // process.version for tooling.  The lyric is UTF-8: FPrintF writes it
+      // through WriteConsoleW on a Windows console (printf would hand the raw
+      // bytes to the console code page, e.g. GBK), and as plain UTF-8 bytes to
+      // a pipe or file.
+      FPrintF(stdout, "%s\n", REXMIRROR_RELEASE_LYRIC);
       result->exit_code_ = ExitCode::kNoFailure;
       result->early_return_ = true;
       return result;

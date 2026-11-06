@@ -43,6 +43,11 @@ transitioning builtin ProxyPreventExtensions(
       }
     } else {
       if (doThrow == True) {
+        // RexMirror: Janus proxies use their own template (same text).
+        if ((proxy.flags & kIsJanus) != 0) {
+          ThrowTypeError(
+              MessageTemplate::kJanusProxyTrapReturnedFalsish, kTrapName);
+        }
         ThrowTypeError(MessageTemplate::kProxyTrapReturnedFalsish, kTrapName);
       }
       return False;

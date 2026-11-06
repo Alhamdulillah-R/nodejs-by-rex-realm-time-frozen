@@ -327,6 +327,12 @@ namespace internal {
   T(ProxyTrapReturnedFalsish, "'%' on proxy: trap returned falsish")           \
   T(ProxyTrapReturnedFalsishFor,                                               \
     "'%' on proxy: trap returned falsish for property '%'")                    \
+  /* RexMirror: the same two texts, thrown when a Janus proxy's trap returns */ \
+  /* false. A separate key lets the engine error hook tell the framework's */  \
+  /* own proxies apart from page proxies. */                                   \
+  T(JanusProxyTrapReturnedFalsish, "'%' on proxy: trap returned falsish")      \
+  T(JanusProxyTrapReturnedFalsishFor,                                          \
+    "'%' on proxy: trap returned falsish for property '%'")                    \
   T(RedefineDisallowed, "Cannot redefine property: %")                         \
   T(RedefineExternalArray,                                                     \
     "Cannot redefine a property of an object with external array elements")    \

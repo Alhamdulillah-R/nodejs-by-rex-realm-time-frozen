@@ -98,6 +98,7 @@ class ExternalReferenceRegistry {
   V(process_wrap)                                                              \
   V(realm_time)                                                                \
   V(report)                                                                    \
+  V(rex_native)                                                                \
   V(task_queue)                                                                \
   V(tcp_wrap)                                                                  \
   V(tty_wrap)                                                                  \

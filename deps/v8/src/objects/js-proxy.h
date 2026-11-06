@@ -27,6 +27,7 @@ class JSProxy : public TorqueGeneratedJSProxy<JSProxy, JSReceiver> {
       bool revocable);
 
   V8_INLINE bool is_revocable() const;
+  V8_INLINE bool is_janus() const;
   V8_INLINE bool IsRevoked() const;
   static void Revoke(DirectHandle<JSProxy> proxy);
 
@@ -120,7 +121,16 @@ class JSProxy : public TorqueGeneratedJSProxy<JSProxy, JSReceiver> {
                                       PropertyDescriptor* desc,
                                       Maybe<ShouldThrow> should_throw);
 
+  // Whether {object} is on the prototype chain starting at {start}. Janus
+  // proxies are walked through via their getPrototypeOf trap; other proxies
+  // end the walk.
+  V8_WARN_UNUSED_RESULT static Maybe<bool> JanusChainContains(
+      Isolate* isolate, DirectHandle<JSReceiver> start,
+      DirectHandle<JSReceiver> object);
+
   using IsRevocableBit = base::BitField<bool, 0, 1>;
+  // Janus proxies: trap results are not checked against the target.
+  using IsJanusBit = IsRevocableBit::Next<bool, 1>;
 
   static constexpr int kIsRevocableBit = IsRevocableBit::encode(true);
 

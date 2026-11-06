@@ -257,6 +257,24 @@ BUILTIN(FunctionPrototypeToString) {
   if (IsJSBoundFunction(*receiver)) {
     return *JSBoundFunction::ToString(isolate, Cast<JSBoundFunction>(receiver));
   }
+  // RexMirror: a function carrying the API private "rex.proxy_source" (set by
+  // RexMirror.native.setProxySource), or a Proxy whose direct target carries
+  // it, prints that text: a host builtin written in JS reads like a native
+  // function, a proxy standing in for a remote function reads like it.
+  if (IsJSFunction(*receiver) || IsJSProxy(*receiver)) {
+    DirectHandle<Object> holder = receiver;
+    if (IsJSProxy(*receiver)) {
+      holder = DirectHandle<Object>(Cast<JSProxy>(*receiver)->target(), isolate);
+    }
+    if (IsJSReceiver(*holder)) {
+      DirectHandle<Symbol> key = isolate->SymbolFor(
+          RootIndex::kApiPrivateSymbolTable,
+          isolate->factory()->InternalizeUtf8String("rex.proxy_source"), true);
+      DirectHandle<Object> source = JSReceiver::GetDataProperty(
+          isolate, Cast<JSReceiver>(holder), key);
+      if (IsString(*source)) return *source;
+    }
+  }
   if (IsJSFunction(*receiver)) {
     return *JSFunction::ToString(isolate, Cast<JSFunction>(receiver));
   }
@@ -277,6 +295,19 @@ BUILTIN(FunctionPrototypeToString) {
 
 namespace {
 
+// RexMirror: a function marked by RexMirror.native.setIdlInterface is a Web IDL
+// interface object in the sandbox (Blob / URL / TextEncoder ... are Node JS classes
+// there). Chrome reads its caller / arguments as null, so the getters do the same.
+bool IsRexWebIdlInterface(Isolate* isolate, DirectHandle<Object> receiver) {
+  if (!IsJSFunction(*receiver)) return false;
+  DirectHandle<Symbol> key = isolate->SymbolFor(
+      RootIndex::kApiPrivateSymbolTable,
+      isolate->factory()->InternalizeUtf8String("rex.web_idl_interface"), true);
+  DirectHandle<Object> mark = JSReceiver::GetDataProperty(
+      isolate, Cast<JSReceiver>(receiver), key);
+  return IsString(*mark);
+}
+
 bool IsSloppyNormalJSFunction(Tagged<Object> receiver) {
   if (!IsJSFunction(receiver)) return false;
   Tagged<JSFunction> function = Cast<JSFunction>(receiver);
@@ -288,6 +319,9 @@ bool IsSloppyNormalJSFunction(Tagged<Object> receiver) {
 BUILTIN(FunctionPrototypeLegacyArgumentsGetter) {
   HandleScope scope(isolate);
   DirectHandle<Object> receiver = args.receiver();
+  if (IsRexWebIdlInterface(isolate, receiver)) {
+    return ReadOnlyRoots(isolate).null_value();
+  }
   if (!IsSloppyNormalJSFunction(*receiver)) {
     THROW_NEW_ERROR_RETURN_FAILURE(
         isolate, NewTypeError(MessageTemplate::kStrictPoisonPill));
@@ -312,6 +346,9 @@ BUILTIN(FunctionPrototypeLegacyArgumentsSetter) {
 BUILTIN(FunctionPrototypeLegacyCallerGetter) {
   HandleScope scope(isolate);
   DirectHandle<Object> receiver = args.receiver();
+  if (IsRexWebIdlInterface(isolate, receiver)) {
+    return ReadOnlyRoots(isolate).null_value();
+  }
   if (!IsSloppyNormalJSFunction(*receiver)) {
     THROW_NEW_ERROR_RETURN_FAILURE(
         isolate, NewTypeError(MessageTemplate::kStrictPoisonPill));

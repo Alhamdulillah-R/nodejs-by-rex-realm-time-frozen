@@ -72,9 +72,17 @@ transitioning builtin ProxySetProperty(
       CheckGetSetTrapResult(target, proxy, name, value, kProxySet);
       return value;
     }
-    ThrowTypeErrorIfStrict(
-        SmiConstant(MessageTemplate::kProxyTrapReturnedFalsishFor), 'set',
-        name);
+    // RexMirror: Janus proxies throw with their own template (same text), so
+    // the engine error hook only rewrites the framework's own failures.
+    if ((proxy.flags & kIsJanus) != 0) {
+      ThrowTypeErrorIfStrict(
+          SmiConstant(MessageTemplate::kJanusProxyTrapReturnedFalsishFor),
+          'set', name);
+    } else {
+      ThrowTypeErrorIfStrict(
+          SmiConstant(MessageTemplate::kProxyTrapReturnedFalsishFor), 'set',
+          name);
+    }
     return value;
   } label TrapUndefined(target: Object) {
     // 7.a. Return ? target.[[Set]](P, V, Receiver).

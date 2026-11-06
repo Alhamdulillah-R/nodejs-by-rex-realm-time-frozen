@@ -10,9 +10,11 @@
 // (with its change list) to `releases` in lib/internal/bootstrap/node.js,
 // rebuild both hosts, tag release/<serial>-<slug>.  Bootstrap refuses to
 // start when the two records disagree.
-#define REXMIRROR_RELEASE_SERIAL 2
-#define REXMIRROR_RELEASE_LYRIC "She was more like a beauty queen from a movie scene"
-#define REXMIRROR_RELEASE_SONG "Billie Jean"
-#define REXMIRROR_RELEASE_DATE "2026-09-05"
+// Strings are UTF-8; non-ASCII bytes are written as escapes so the result does
+// not depend on the compiler's source charset (\xc3\xb9 is "u with grave").
+#define REXMIRROR_RELEASE_SERIAL 3
+#define REXMIRROR_RELEASE_LYRIC "Sais-tu o\xc3\xb9 fleurissent les citronniers?"
+#define REXMIRROR_RELEASE_SONG "Mignon"
+#define REXMIRROR_RELEASE_DATE "2026-11-06"
 
 #endif  // SRC_REXMIRROR_RELEASE_H_

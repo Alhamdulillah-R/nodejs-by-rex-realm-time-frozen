@@ -43,6 +43,12 @@ transitioning builtin ProxyDeleteProperty(
     if (!ToBoolean(trapResult)) {
       const strictValue: LanguageModeSmi = LanguageMode::kStrict;
       if (languageMode == strictValue) {
+        // RexMirror: Janus proxies use their own template (same text).
+        if ((proxy.flags & kIsJanus) != 0) {
+          ThrowTypeError(
+              MessageTemplate::kJanusProxyTrapReturnedFalsishFor, kTrapName,
+              name);
+        }
         ThrowTypeError(
             MessageTemplate::kProxyTrapReturnedFalsishFor, kTrapName, name);
       }

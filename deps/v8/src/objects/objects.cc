@@ -3094,6 +3094,24 @@ Maybe<bool> JSProxy::CheckHasTrap(Isolate* isolate, DirectHandle<Name> name,
   return Just(true);
 }
 
+namespace {
+
+// RexMirror: a Janus proxy whose trap returns false throws with the Janus
+// template. The text is identical; only the key differs, so the engine error
+// hook rewrites the message for the framework's own proxies and never for a
+// page proxy that happens to fail on the same property.
+MessageTemplate ProxyTrapFalsishTemplate(DirectHandle<JSProxy> proxy,
+                                         bool for_property) {
+  if (proxy->is_janus()) {
+    return for_property ? MessageTemplate::kJanusProxyTrapReturnedFalsishFor
+                        : MessageTemplate::kJanusProxyTrapReturnedFalsish;
+  }
+  return for_property ? MessageTemplate::kProxyTrapReturnedFalsishFor
+                      : MessageTemplate::kProxyTrapReturnedFalsish;
+}
+
+}  // namespace
+
 Maybe<bool> JSProxy::SetProperty(DirectHandle<JSProxy> proxy,
                                  DirectHandle<Name> name,
                                  DirectHandle<Object> value,
@@ -3131,7 +3149,7 @@ Maybe<bool> JSProxy::SetProperty(DirectHandle<JSProxy> proxy,
       Execution::Call(isolate, trap, handler, base::VectorOf(args)));
   if (!Object::BooleanValue(*trap_result, isolate)) {
     RETURN_FAILURE(isolate, GetShouldThrow(isolate, should_throw),
-                   NewTypeError(MessageTemplate::kProxyTrapReturnedFalsishFor,
+                   NewTypeError(ProxyTrapFalsishTemplate(proxy, true),
                                 trap_name, name));
   }
 
@@ -3178,7 +3196,7 @@ Maybe<bool> JSProxy::DeletePropertyOrElement(DirectHandle<JSProxy> proxy,
       Execution::Call(isolate, trap, handler, base::VectorOf(args)));
   if (!Object::BooleanValue(*trap_result, isolate)) {
     RETURN_FAILURE(isolate, should_throw,
-                   NewTypeError(MessageTemplate::kProxyTrapReturnedFalsishFor,
+                   NewTypeError(ProxyTrapFalsishTemplate(proxy, true),
                                 trap_name, name));
   }
 
@@ -3502,9 +3520,11 @@ Maybe<bool> JSProxy::DefineOwnProperty(Isolate* isolate,
   // 10. If booleanTrapResult is false, return false.
   if (!Object::BooleanValue(*trap_result_obj, isolate)) {
     RETURN_FAILURE(isolate, GetShouldThrow(isolate, should_throw),
-                   NewTypeError(MessageTemplate::kProxyTrapReturnedFalsishFor,
+                   NewTypeError(ProxyTrapFalsishTemplate(proxy, true),
                                 trap_name, property_name));
   }
+  // Janus proxies: the trap result is not checked against the target.
+  if (proxy->is_janus()) return Just(true);
   // 11. Let targetDesc be ? target.[[GetOwnProperty]](P).
   PropertyDescriptor target_desc;
   Maybe<bool> target_found =
@@ -3668,6 +3688,17 @@ Maybe<bool> JSProxy::GetOwnPropertyDescriptor(Isolate* isolate,
         MessageTemplate::kProxyGetOwnPropertyDescriptorInvalid, name));
     return Nothing<bool>();
   }
+  // Janus proxies: the trap result is not checked against the target.
+  if (proxy->is_janus()) {
+    if (IsUndefined(*trap_result_obj, isolate)) return Just(false);
+    if (!PropertyDescriptor::ToPropertyDescriptor(isolate, trap_result_obj,
+                                                  desc)) {
+      DCHECK(isolate->has_exception());
+      return Nothing<bool>();
+    }
+    PropertyDescriptor::CompletePropertyDescriptor(isolate, desc);
+    return Just(true);
+  }
   // 10. Let targetDesc be ? target.[[GetOwnProperty]](P).
   PropertyDescriptor target_desc;
   Maybe<bool> found =
@@ -3777,7 +3808,7 @@ Maybe<bool> JSProxy::PreventExtensions(DirectHandle<JSProxy> proxy,
   if (!Object::BooleanValue(*trap_result, isolate)) {
     RETURN_FAILURE(
         isolate, should_throw,
-        NewTypeError(MessageTemplate::kProxyTrapReturnedFalsish, trap_name));
+        NewTypeError(ProxyTrapFalsishTemplate(proxy, false), trap_name));
   }
 
   // Enforce the invariant.
@@ -3817,6 +3848,15 @@ Maybe<bool> JSProxy::IsExtensible(DirectHandle<JSProxy> proxy) {
   ASSIGN_RETURN_ON_EXCEPTION(
       isolate, trap_result,
       Execution::Call(isolate, trap, handler, base::VectorOf(args)));
+
+  // Janus proxies: the trap result is authoritative. The target is a dummy
+  // (the JS side refuses preventExtensions, so it stays extensible), so the
+  // invariant against the target is skipped, same as gOPD / defineProperty.
+  // Both directions follow the trap (trap true with a non-extensible target,
+  // and trap false with an extensible target).
+  if (proxy->is_janus()) {
+    return Just(Object::BooleanValue(*trap_result, isolate));
+  }
 
   // Enforce the invariant.
   Maybe<bool> target_result = JSReceiver::IsExtensible(isolate, target);
@@ -4470,6 +4510,30 @@ Maybe<bool> JSArray::SetLength(Isolate* isolate, DirectHandle<JSArray> array,
   return array->GetElementsAccessor()->SetLength(isolate, array, new_length);
 }
 
+// static
+Maybe<bool> JSProxy::JanusChainContains(Isolate* isolate,
+                                        DirectHandle<JSReceiver> start,
+                                        DirectHandle<JSReceiver> object) {
+  DirectHandle<Object> current = start;
+  for (int seen = 0; seen < kMaxIterationLimit; seen++) {
+    if (!IsJSReceiver(*current)) return Just(false);
+    if (*current == *object) return Just(true);
+    if (IsJSProxy(*current)) {
+      DirectHandle<JSProxy> proxy = Cast<JSProxy>(current);
+      if (!proxy->is_janus() || proxy->IsRevoked()) return Just(false);
+      DirectHandle<JSPrototype> next;
+      if (!JSProxy::GetPrototype(proxy).ToHandle(&next)) {
+        return Nothing<bool>();
+      }
+      current = next;
+      continue;
+    }
+    current = direct_handle(Cast<JSReceiver>(*current)->map()->prototype(),
+                            isolate);
+  }
+  return Just(false);
+}
+
 // ES6: 9.5.2 [[SetPrototypeOf]] (V)
 // static
 Maybe<bool> JSProxy::SetPrototype(Isolate* isolate, DirectHandle<JSProxy> proxy,
@@ -4491,6 +4555,17 @@ Maybe<bool> JSProxy::SetPrototype(Isolate* isolate, DirectHandle<JSProxy> proxy,
   }
   // 5. Let target be the value of the [[ProxyTarget]] internal slot.
   DirectHandle<JSReceiver> target(Cast<JSReceiver>(proxy->target()), isolate);
+  // Janus proxies reject prototype cycles like ordinary objects, before the
+  // trap runs.
+  if (proxy->is_janus() && IsJSReceiver(*value)) {
+    Maybe<bool> cycle =
+        JanusChainContains(isolate, Cast<JSReceiver>(value), proxy);
+    MAYBE_RETURN(cycle, Nothing<bool>());
+    if (cycle.FromJust()) {
+      RETURN_FAILURE(isolate, should_throw,
+                     NewTypeError(MessageTemplate::kCyclicProto));
+    }
+  }
   // 6. Let trap be ? GetMethod(handler, "getPrototypeOf").
   DirectHandle<Object> trap;
   ASSIGN_RETURN_ON_EXCEPTION(
@@ -4512,7 +4587,7 @@ Maybe<bool> JSProxy::SetPrototype(Isolate* isolate, DirectHandle<JSProxy> proxy,
   if (!bool_trap_result) {
     RETURN_FAILURE(
         isolate, should_throw,
-        NewTypeError(MessageTemplate::kProxyTrapReturnedFalsish, trap_name));
+        NewTypeError(ProxyTrapFalsishTemplate(proxy, false), trap_name));
   }
   // 10. Let extensibleTarget be ? IsExtensible(target).
   Maybe<bool> is_extensible = JSReceiver::IsExtensible(isolate, target);
@@ -4522,7 +4597,7 @@ Maybe<bool> JSProxy::SetPrototype(Isolate* isolate, DirectHandle<JSProxy> proxy,
     if (bool_trap_result) return Just(true);
     RETURN_FAILURE(
         isolate, should_throw,
-        NewTypeError(MessageTemplate::kProxyTrapReturnedFalsish, trap_name));
+        NewTypeError(ProxyTrapFalsishTemplate(proxy, false), trap_name));
   }
   // 12. Let targetProto be ? target.[[GetPrototypeOf]]().
   DirectHandle<Object> target_proto;

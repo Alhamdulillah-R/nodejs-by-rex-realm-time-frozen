@@ -699,8 +699,25 @@ static bool IsStackOverflowError(Isolate* isolate, Local<Value> exception) {
   return message.ToStringView() == "Maximum call stack size exceeded";
 }
 
-namespace errors {
+// RexMirror: C++ 错误插入点. 找到 RexMirror.native.getErrorHook() 就调用 hook(err, code); 没注册时什么都不做.
+// hook 自己抛的错被 TryCatch 吞掉, 不替换原来的错误.
+void RexApplyErrorHook(v8::Isolate* isolate, v8::Local<v8::Object> err, const char* code) {
+  v8::HandleScope scope(isolate);
+  v8::Local<v8::Context> context = isolate->GetCurrentContext();
+  v8::TryCatch try_catch(isolate);
+  v8::Local<v8::Value> rex;
+  if (!context->Global()->Get(context, v8::String::NewFromUtf8Literal(isolate, "RexMirror")).ToLocal(&rex) || !rex->IsObject()) return;
+  v8::Local<v8::Value> native;
+  if (!rex.As<v8::Object>()->Get(context, v8::String::NewFromUtf8Literal(isolate, "native")).ToLocal(&native) || !native->IsObject()) return;
+  v8::Local<v8::Value> getter;
+  if (!native.As<v8::Object>()->Get(context, v8::String::NewFromUtf8Literal(isolate, "getErrorHook")).ToLocal(&getter) || !getter->IsFunction()) return;
+  v8::Local<v8::Value> hook;
+  if (!getter.As<v8::Function>()->Call(context, native, 0, nullptr).ToLocal(&hook) || !hook->IsFunction()) return;
+  v8::Local<v8::Value> argv[2] = {err, v8::String::NewFromUtf8(isolate, code).ToLocalChecked()};
+  hook.As<v8::Function>()->Call(context, v8::Undefined(isolate), 2, argv).IsEmpty();
+}
 
+namespace errors {
 TryCatchScope::~TryCatchScope() {
   if (HasCaught() && !HasTerminated() && mode_ != CatchMode::kNormal) {
     HandleScope scope(env_->isolate());

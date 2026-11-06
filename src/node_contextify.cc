@@ -648,6 +648,27 @@ Intercepted ContextifyContext::PropertySetterCallback(
     return Intercepted::kNo;
   }
 
+  // RexMirror: a getter-only accessor on the sandbox (such as the unforgeable
+  // window.document) rejects the assignment, as [[Set]] does on any object
+  if (is_declared_on_sandbox) {
+    Local<Value> own_desc;
+    if (ctx->sandbox()
+            ->GetOwnPropertyDescriptor(context, property)
+            .ToLocal(&own_desc) &&
+        own_desc->IsObject()) {
+      Environment* env = Environment::GetCurrent(context);
+      Local<Object> own_desc_obj = own_desc.As<Object>();
+      Local<Value> setter;
+      if (own_desc_obj->HasOwnProperty(context, env->get_string())
+              .FromMaybe(false) &&
+          own_desc_obj->Get(context, env->set_string()).ToLocal(&setter) &&
+          setter->IsUndefined()) {
+        args.GetReturnValue().Set(false);
+        return Intercepted::kYes;
+      }
+    }
+  }
+
   bool is_declared = is_declared_on_global_proxy || is_declared_on_sandbox;
 
   if (!is_declared && property->IsSymbol()) {

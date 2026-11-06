@@ -1987,15 +1987,19 @@ void GetReleaseInfoBinding(const FunctionCallbackInfo<Value>& args) {
             OneByteString(isolate, "serial"),
             Integer::New(isolate, REXMIRROR_RELEASE_SERIAL))
       .Check();
+  // Lyrics and song titles are UTF-8 (e.g. French accents); OneByteString
+  // would read the bytes as Latin-1 and break the match with bootstrap's record.
   result
       ->Set(context,
             OneByteString(isolate, "lyric"),
-            OneByteString(isolate, REXMIRROR_RELEASE_LYRIC))
+            String::NewFromUtf8(isolate, REXMIRROR_RELEASE_LYRIC)
+                .ToLocalChecked())
       .Check();
   result
       ->Set(context,
             OneByteString(isolate, "song"),
-            OneByteString(isolate, REXMIRROR_RELEASE_SONG))
+            String::NewFromUtf8(isolate, REXMIRROR_RELEASE_SONG)
+                .ToLocalChecked())
       .Check();
   result
       ->Set(context,

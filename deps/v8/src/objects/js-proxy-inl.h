@@ -24,6 +24,8 @@ TQ_OBJECT_CONSTRUCTORS_IMPL(JSProxy)
 
 bool JSProxy::is_revocable() const { return IsRevocableBit::decode(flags()); }
 
+bool JSProxy::is_janus() const { return IsJanusBit::decode(flags()); }
+
 bool JSProxy::IsRevoked() const { return !IsJSReceiver(handler()); }
 
 }  // namespace internal

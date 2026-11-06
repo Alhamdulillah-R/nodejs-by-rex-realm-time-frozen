@@ -6,6 +6,8 @@
 
 namespace proxy {
 
+const kIsJanus: constexpr int32 generates 'JSProxy::IsJanusBit::kMask';
+
 // ES #sec-proxy-object-internal-methods-and-internal-slots-setprototypeof-v
 // https://tc39.es/ecma262/#sec-proxy-object-internal-methods-and-internal-slots-setprototypeof-v
 transitioning builtin ProxySetPrototypeOf(
@@ -13,6 +15,14 @@ transitioning builtin ProxySetPrototypeOf(
     doThrow: Boolean): JSAny {
   PerformStackCheck();
   const kTrapName: constexpr string = 'setPrototypeOf';
+  // Janus proxies take the runtime path (JSProxy::SetPrototype), which
+  // rejects prototype cycles before the trap runs.
+  if ((proxy.flags & kIsJanus) != 0) {
+    if (doThrow == True) {
+      return runtime::JSReceiverSetPrototypeOfThrow(proxy, proto);
+    }
+    return runtime::JSReceiverSetPrototypeOfDontThrow(proxy, proto);
+  }
   try {
     // 1. Assert: Either Type(V) is Object or Type(V) is Null.
     dcheck(proto == Null || Is<JSReceiver>(proto));
