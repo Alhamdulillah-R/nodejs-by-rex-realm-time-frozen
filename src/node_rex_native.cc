@@ -4,6 +4,7 @@
 #include "node_external_reference.h"
 #include "node_internals.h"
 #include "util-inl.h"
+#include "v8-rex-interceptor.h"
 
 #include <memory>
 #include <mutex>
@@ -880,6 +881,20 @@ void SetJanusError(const FunctionCallbackInfo<Value>& args) {
 /**
  * Makes the prototype of a context's globalThis immutable, like Window.
  */
+// The globalThis of the realm whose code is calling, skipping the frames of
+// the main context (the framework's own code, e.g. the Proxy trap that
+// forwards the call); null when no other realm's code is on the stack.
+void IncumbentGlobal(const FunctionCallbackInfo<Value>& args) {
+  Environment* env = Environment::GetCurrent(args);
+  Local<Object> global;
+  if (v8::rex::IncumbentGlobalProxy(env->isolate(), env->context())
+          .ToLocal(&global)) {
+    args.GetReturnValue().Set(global);
+  } else {
+    args.GetReturnValue().SetNull();
+  }
+}
+
 void LockGlobalPrototype(const FunctionCallbackInfo<Value>& args) {
   Environment* env = Environment::GetCurrent(args);
   if (!args[0]->IsObject()) {
@@ -979,6 +994,7 @@ void Initialize(Local<Object> target,
   SetMethod(context, target, "setJanusTypeof", SetJanusTypeof);
   SetMethod(context, target, "setJanusError", SetJanusError);
   SetMethod(context, target, "lockGlobalPrototype", LockGlobalPrototype);
+  SetMethod(context, target, "incumbentGlobal", IncumbentGlobal);
   // RexMirror: 引擎错误回调在运行时由 enableEngineErrorHook 注册 (不在 snapshot 构建期间注册)
   SetMethod(context, target, "enableEngineErrorHook", EnableEngineErrorHook);
 }
@@ -1000,6 +1016,7 @@ void RegisterExternalReferences(ExternalReferenceRegistry* registry) {
   registry->Register(SetJanusTypeof);
   registry->Register(SetJanusError);
   registry->Register(LockGlobalPrototype);
+  registry->Register(IncumbentGlobal);
   registry->Register(EnableEngineErrorHook);
   registry->Register(NamedGet);
   registry->Register(NamedSet);

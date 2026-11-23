@@ -8853,6 +8853,30 @@ MaybeLocal<Value> CurrentInterceptorReceiver(Isolate* v8_isolate) {
   return Utils::ToLocal(i::direct_handle(receiver, i_isolate));
 }
 
+MaybeLocal<Object> IncumbentGlobalProxy(Isolate* v8_isolate,
+                                        Local<Context> host) {
+  i::Isolate* i_isolate = reinterpret_cast<i::Isolate*>(v8_isolate);
+  i::Tagged<i::NativeContext> host_context = *Utils::OpenDirectHandle(*host);
+  // Same frame walk as Isolate::GetIncumbentContextSlow
+  for (i::JavaScriptStackFrameIterator it(i_isolate); !it.done();
+       it.Advance()) {
+    i::Tagged<i::NativeContext> native_context =
+        i::Cast<i::Context>(it.frame()->context())->native_context();
+    if (native_context == host_context) continue;
+    return Utils::ToLocal(i::direct_handle(
+        i::Cast<i::JSObject>(native_context->global_proxy()), i_isolate));
+  }
+  return MaybeLocal<Object>();
+}
+
+Local<Object> GlobalObject(Isolate* v8_isolate, Local<Context> context) {
+  i::Isolate* i_isolate = reinterpret_cast<i::Isolate*>(v8_isolate);
+  i::Tagged<i::NativeContext> native_context =
+      *Utils::OpenDirectHandle(*context);
+  return Utils::ToLocal(i::direct_handle(
+      i::Cast<i::JSObject>(native_context->global_object()), i_isolate));
+}
+
 }  // namespace rex
 
 void Proxy::Revoke() {

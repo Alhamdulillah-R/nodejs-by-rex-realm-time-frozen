@@ -8,6 +8,7 @@
 #include "node_context_data.h"
 #include "node_errors.h"
 #include "node_realm_time.h"
+#include "v8-rex-interceptor.h"
 
 namespace node {
 class ExternalReferenceRegistry;
@@ -22,6 +23,9 @@ struct ContextOptions {
   std::unique_ptr<v8::MicrotaskQueue> own_microtask_queue;
   v8::Local<v8::Symbol> host_defined_options_id;
   bool vanilla = false;
+  // RexMirror: the context whose global proxy the new context takes over
+  // (vm.createContext options.rexReplaceContext); empty for a fresh proxy.
+  v8::Local<v8::Context> replaced_context;
 };
 
 /**
@@ -97,7 +101,8 @@ class ContextifyContext final : CPPGC_MIXIN(ContextifyContext) {
       v8::Isolate* isolate,
       v8::Local<v8::ObjectTemplate> object_template,
       const SnapshotData* snapshot_data,
-      v8::MicrotaskQueue* queue);
+      v8::MicrotaskQueue* queue,
+      v8::MaybeLocal<v8::Value> global_proxy = {});
   static void CreatePerIsolateProperties(IsolateData* isolate_data,
                                          v8::Local<v8::ObjectTemplate> target);
   static void RegisterExternalReferences(ExternalReferenceRegistry* registry);
@@ -111,6 +116,14 @@ class ContextifyContext final : CPPGC_MIXIN(ContextifyContext) {
 
   inline v8::Local<v8::Object> global_proxy() const {
     return context()->Global();
+  }
+
+  // RexMirror: what is declared on this context's global is looked up on its
+  // global object, not through the global proxy: once another context has
+  // taken the proxy over (rexReplaceContext) the proxy reaches that context's
+  // global. While this context owns the proxy both give the same answer.
+  inline v8::Local<v8::Object> global_object() const {
+    return v8::rex::GlobalObject(env()->isolate(), context());
   }
 
   inline v8::Local<v8::Object> sandbox() const {

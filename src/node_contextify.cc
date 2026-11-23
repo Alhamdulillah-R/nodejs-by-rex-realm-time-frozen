@@ -160,8 +160,18 @@ ContextifyContext* ContextifyContext::New(Environment* env,
           ? options->own_microtask_queue.get()
           : env->isolate()->GetCurrentContext()->GetMicrotaskQueue();
 
+  // RexMirror: taking over a global proxy detaches it from the context that
+  // owned it first (V8 requires a detached proxy); see
+  // ContextOptions::replaced_context.
+  MaybeLocal<Value> global_proxy;
+  if (!options->replaced_context.IsEmpty()) {
+    global_proxy = options->replaced_context->Global();
+    options->replaced_context->DetachGlobal();
+  }
+
   Local<Context> v8_context;
-  if (!(CreateV8Context(env->isolate(), object_template, snapshot_data, queue)
+  if (!(CreateV8Context(
+            env->isolate(), object_template, snapshot_data, queue, global_proxy)
             .ToLocal(&v8_context))) {
     // Allocation failure, maximum call stack size reached, termination, etc.
     return {};
@@ -255,7 +265,8 @@ MaybeLocal<Context> ContextifyContext::CreateV8Context(
     Isolate* isolate,
     Local<ObjectTemplate> object_template,
     const SnapshotData* snapshot_data,
-    MicrotaskQueue* queue) {
+    MicrotaskQueue* queue,
+    MaybeLocal<Value> global_proxy) {
   EscapableHandleScope scope(isolate);
 
   Local<Context> ctx;
@@ -264,7 +275,7 @@ MaybeLocal<Context> ContextifyContext::CreateV8Context(
         isolate,
         nullptr,  // extensions
         object_template,
-        {},                                       // global object
+        global_proxy,                             // global object
         v8::DeserializeInternalFieldsCallback(),  // deserialization callback
         queue);
     if (ctx.IsEmpty() || InitializeBaseContextForSnapshot(ctx).IsNothing()) {
@@ -276,7 +287,7 @@ MaybeLocal<Context> ContextifyContext::CreateV8Context(
                   v8::DeserializeInternalFieldsCallback(),  // deserialization
                                                             // callback
                   nullptr,                                  // extensions
-                  {},                                       // global object
+                  global_proxy,                             // global object
                   queue)
                   .ToLocal(&ctx)) {
     return MaybeLocal<Context>();
@@ -431,7 +442,7 @@ void ContextifyContext::MakeContext(const FunctionCallbackInfo<Value>& args) {
   Environment* env = Environment::GetCurrent(args);
   ContextOptions options;
 
-  CHECK_EQ(args.Length(), 7);
+  CHECK_EQ(args.Length(), 8);
   Local<Object> sandbox;
   if (args[0]->IsObject()) {
     sandbox = args[0].As<Object>();
@@ -466,6 +477,17 @@ void ContextifyContext::MakeContext(const FunctionCallbackInfo<Value>& args) {
 
   CHECK(args[6]->IsSymbol());
   options.host_defined_options_id = args[6].As<Symbol>();
+
+  // rexReplaceContext (lib/vm.js has checked it is another contextified object)
+  if (args[7]->IsObject()) {
+    CHECK(!sandbox.IsEmpty());
+    ContextifyContext* replaced =
+        ContextFromContextifiedSandbox(env, args[7].As<Object>());
+    CHECK_NOT_NULL(replaced);
+    options.replaced_context = replaced->context();
+  } else {
+    CHECK(args[7]->IsUndefined());
+  }
 
   TryCatchScope try_catch(env);
   ContextifyContext* context_ptr =
@@ -554,12 +576,12 @@ Intercepted ContextifyContext::PropertyQueryCallback(
     args.GetReturnValue().Set(attr);
     return Intercepted::kYes;
   } else {
-    maybe_has = ctx->global_proxy()->HasRealNamedProperty(context, property);
+    maybe_has = ctx->global_object()->HasRealNamedProperty(context, property);
     if (maybe_has.IsNothing()) {
       return Intercepted::kNo;
     } else if (maybe_has.FromJust()) {
       Maybe<PropertyAttribute> maybe_attr =
-          ctx->global_proxy()->GetRealNamedPropertyAttributes(context,
+          ctx->global_object()->GetRealNamedPropertyAttributes(context,
                                                               property);
       if (!maybe_attr.To(&attr)) {
         return Intercepted::kNo;
@@ -656,11 +678,11 @@ Intercepted ContextifyContext::PropertyGetterCallback(
   MaybeLocal<Value> maybe_rv =
       sandbox->GetRealNamedProperty(context, property);
   if (maybe_rv.IsEmpty()) {
-    if (LookupReachesProxy(context, ctx->global_proxy(), property)) {
+    if (LookupReachesProxy(context, ctx->global_object(), property)) {
       return Intercepted::kNo;
     }
     maybe_rv =
-        ctx->global_proxy()->GetRealNamedProperty(context, property);
+        ctx->global_object()->GetRealNamedProperty(context, property);
   }
 
   Local<Value> rv;
@@ -697,7 +719,7 @@ Intercepted ContextifyContext::PropertySetterCallback(
 
   Local<Context> context = ctx->context();
   PropertyAttribute attributes = PropertyAttribute::None;
-  bool is_declared_on_global_proxy = ctx->global_proxy()
+  bool is_declared_on_global_proxy = ctx->global_object()
       ->GetRealNamedPropertyAttributes(context, property)
       .To(&attributes);
   bool read_only =
@@ -811,7 +833,7 @@ Intercepted ContextifyContext::PropertyDefinerCallback(
 
   PropertyAttribute attributes = PropertyAttribute::None;
   bool is_declared =
-      ctx->global_proxy()->GetRealNamedPropertyAttributes(context,
+      ctx->global_object()->GetRealNamedPropertyAttributes(context,
                                                           property)
           .To(&attributes);
   bool read_only =
