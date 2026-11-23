@@ -571,6 +571,24 @@ Intercepted ContextifyContext::PropertyQueryCallback(
   return Intercepted::kNo;
 }
 
+// RexMirror: whether looking `property` up from `object` along the prototype
+// chain meets a JS Proxy before any object that owns the property. Own checks
+// use HasRealNamedProperty, which does not call interceptors.
+static bool LookupReachesProxy(Local<Context> context,
+                               Local<Object> object,
+                               Local<Name> property) {
+  Local<Value> current = object;
+  while (current->IsObject()) {
+    if (current->IsProxy()) return true;
+    Local<Object> holder = current.As<Object>();
+    if (holder->HasRealNamedProperty(context, property).FromMaybe(false)) {
+      return false;
+    }
+    current = holder->GetPrototypeV2();
+  }
+  return false;
+}
+
 // static
 Intercepted ContextifyContext::PropertyGetterCallback(
     Local<Name> property, const PropertyCallbackInfo<Value>& args) {
@@ -588,10 +606,23 @@ Intercepted ContextifyContext::PropertyGetterCallback(
   Local<Context> context = ctx->context();
   Local<Object> sandbox = ctx->sandbox();
 
+  // RexMirror: GetRealNamedProperty treats a JS Proxy on the prototype chain
+  // as a hit and returns whatever its get trap gives (undefined for a missing
+  // name), so a bare read of an undeclared global produced undefined instead
+  // of a ReferenceError. When the lookup would reach a proxy before finding
+  // an own property, leave it to V8: its global reference load asks the
+  // proxy's has trap first and throws when the name is absent.
+  if (LookupReachesProxy(context, sandbox, property)) {
+    return Intercepted::kNo;
+  }
+
   TryCatchScope try_catch(env);
   MaybeLocal<Value> maybe_rv =
       sandbox->GetRealNamedProperty(context, property);
   if (maybe_rv.IsEmpty()) {
+    if (LookupReachesProxy(context, ctx->global_proxy(), property)) {
+      return Intercepted::kNo;
+    }
     maybe_rv =
         ctx->global_proxy()->GetRealNamedProperty(context, property);
   }

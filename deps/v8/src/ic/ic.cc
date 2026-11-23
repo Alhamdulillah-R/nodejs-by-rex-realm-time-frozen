@@ -2409,6 +2409,15 @@ MaybeObjectHandle StoreIC::ComputeHandler(LookupIterator* lookup) {
         return MaybeObjectHandle(StoreHandler::StoreSlow(isolate()));
       }
 
+      // RexMirror: a contextual store (receiver is the global object) must
+      // check in Object::SetPropertyInternal that a strict-mode name exists
+      // (the proxy's has trap) before calling [[Set]]. StoreProxy goes straight
+      // to the set trap, so keep these on the slow stub.
+      if (IsJSGlobalObject(*receiver)) {
+        TRACE_HANDLER_STATS(isolate(), StoreIC_SlowStub);
+        return MaybeObjectHandle(StoreHandler::StoreSlow(isolate()));
+      }
+
       return MaybeObjectHandle(StoreHandler::StoreProxy(
           isolate(), lookup_start_object_map(), holder, receiver));
     }

@@ -2370,6 +2370,25 @@ Maybe<bool> Object::SetPropertyInternal(LookupIterator* it,
         // In case of global IC, the receiver is the global object. Replace by
         // the global proxy.
         if (IsJSGlobalObject(*receiver)) {
+          // RexMirror: a contextual store in strict mode to a name the global
+          // object does not have is an unresolvable reference and throws a
+          // ReferenceError (SetMutableBinding, same check as the INTERCEPTOR
+          // case above). With a JS Proxy on the global's prototype chain the
+          // name was never checked: ask the proxy's has trap, and when it is
+          // absent fall through to CheckContextualStoreToJSGlobalObject.
+          // Sloppy stores still go through the proxy's [[Set]] as the spec
+          // says (PutValue -> Set(globalObject)).
+          Isolate* isolate = it->isolate();
+          auto should_throw_value = GetShouldThrow(isolate, should_throw);
+          if (should_throw_value == kThrowOnError) {
+            Maybe<bool> has = JSProxy::HasProperty(
+                isolate, it->GetHolder<JSProxy>(), it->GetName());
+            if (has.IsNothing()) return Nothing<bool>();
+            if (!has.FromJust()) {
+              *found = false;
+              return Nothing<bool>();
+            }
+          }
           receiver = direct_handle(
               Cast<JSGlobalObject>(*receiver)->global_proxy(), it->isolate());
         }
