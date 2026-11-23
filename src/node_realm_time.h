@@ -56,8 +56,15 @@ class RealmTimeController final {
   double CurrentWallTimeMilliseconds(double real_wall_time_ms) const;
   double CurrentMonotonicTimeNanoseconds(uint64_t real_monotonic_time_ns) const;
 
+  /**
+   * Whether external calls freeze the clock; false keeps the transaction
+   * protocol but lets the clock follow real time. Refused while a call is open.
+   */
+  bool SetFreezeEnabled(bool enabled);
+
   bool enabled() const { return enabled_; }
-  bool frozen() const { return !frames_.empty(); }
+  bool freeze_enabled() const { return freeze_enabled_; }
+  bool frozen() const { return freeze_enabled_ && !frames_.empty(); }
   size_t depth() const { return frames_.size(); }
   uint64_t generation() const { return generation_; }
   bool parked() const { return !frames_.empty() && frames_.back().parked; }
@@ -97,6 +104,7 @@ class RealmTimeController final {
   uint64_t NextToken();
 
   bool enabled_ = false;
+  bool freeze_enabled_ = true;
   uint64_t generation_ = 0;
   uint64_t next_sequence_ = 0;
   uv_loop_t* event_loop_ = nullptr;

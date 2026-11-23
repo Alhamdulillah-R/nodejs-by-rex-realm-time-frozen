@@ -8,6 +8,7 @@
 #include "node_contextify.h"
 #include "node_external_reference.h"
 #include "node_internals.h"
+#include "node_perf_common.h"
 #include "node_realm-inl.h"
 #include "util-inl.h"
 
@@ -571,6 +572,8 @@ struct ProcessClockSnapshot {
   double monotonic_time_offset_ns;
   double frozen_wall_time_ms;
   double frozen_monotonic_time_ns;
+  double wall_anchor_ms;
+  uint64_t monotonic_anchor_ns;
 };
 
 // A Realm is a process boundary.  Contexts and Worker isolates still own a
@@ -586,6 +589,10 @@ struct ProcessClockState {
   std::atomic<double> monotonic_time_offset_ns{0};
   std::atomic<double> frozen_wall_time_ms{0};
   std::atomic<double> frozen_monotonic_time_ns{0};
+  // While enabled the real wall clock is this pair advanced by uv_hrtime, so
+  // Date and the monotonic clocks never drift apart across transactions.
+  std::atomic<double> wall_anchor_ms{0};
+  std::atomic<uint64_t> monotonic_anchor_ns{0};
 };
 
 ProcessClockState process_clock;
@@ -598,13 +605,18 @@ void EndProcessClockWrite() {
   process_clock.sequence.fetch_add(1, std::memory_order_release);
 }
 
-bool EnableProcessClock(const RealmTimeController* owner) {
+bool EnableProcessClock(const RealmTimeController* owner,
+                        double wall_anchor_ms,
+                        uint64_t monotonic_anchor_ns) {
   const RealmTimeController* expected = nullptr;
   if (!process_clock.owner.compare_exchange_strong(
           expected, owner, std::memory_order_acq_rel)) {
     return expected == owner;
   }
   BeginProcessClockWrite();
+  process_clock.wall_anchor_ms.store(wall_anchor_ms, std::memory_order_relaxed);
+  process_clock.monotonic_anchor_ns.store(monotonic_anchor_ns,
+                                          std::memory_order_relaxed);
   process_clock.wall_time_offset_ms.store(0, std::memory_order_relaxed);
   process_clock.monotonic_time_offset_ns.store(0, std::memory_order_relaxed);
   process_clock.frozen_wall_time_ms.store(0, std::memory_order_relaxed);
@@ -680,6 +692,10 @@ ProcessClockSnapshot ReadProcessClock() {
         process_clock.frozen_wall_time_ms.load(std::memory_order_relaxed);
     snapshot.frozen_monotonic_time_ns =
         process_clock.frozen_monotonic_time_ns.load(std::memory_order_relaxed);
+    snapshot.wall_anchor_ms =
+        process_clock.wall_anchor_ms.load(std::memory_order_relaxed);
+    snapshot.monotonic_anchor_ns =
+        process_clock.monotonic_anchor_ns.load(std::memory_order_relaxed);
     after = process_clock.sequence.load(std::memory_order_acquire);
   } while (before != after || (after & 1));
   return snapshot;
@@ -1277,8 +1293,25 @@ bool PerformControllerPost(Environment* env,
   return true;
 }
 
-double RealWallTimeMilliseconds(Environment* env) {
-  return std::floor(env->isolate_data()->platform()->CurrentClockTimeMillis());
+double AnchoredWallTimeMilliseconds(const ProcessClockSnapshot& snapshot,
+                                    uint64_t real_monotonic_time_ns) {
+  const int64_t elapsed_ns =
+      static_cast<int64_t>(real_monotonic_time_ns) -
+      static_cast<int64_t>(snapshot.monotonic_anchor_ns);
+  return snapshot.wall_anchor_ms +
+         static_cast<double>(elapsed_ns) / kNanosecondsPerMillisecond;
+}
+
+// Sub-millisecond on purpose: a floored wall clock against the nanosecond
+// monotonic one leaks up to 1ms between Date and performance per transaction.
+// Only Date itself floors, in RealmDateNowCallback.
+double RealWallTimeMilliseconds(Environment* env,
+                                uint64_t real_monotonic_time_ns) {
+  ProcessClockSnapshot snapshot = ReadProcessClock();
+  if (snapshot.enabled) {
+    return AnchoredWallTimeMilliseconds(snapshot, real_monotonic_time_ns);
+  }
+  return env->isolate_data()->platform()->CurrentClockTimeMillis();
 }
 
 uint64_t RealMonotonicTimeNanoseconds() {
@@ -1287,8 +1320,12 @@ uint64_t RealMonotonicTimeNanoseconds() {
 
 int64_t RealmDateNowCallback(Isolate* isolate, int64_t real_time_millis) {
   HandleScope handle_scope(isolate);
+  ProcessClockSnapshot snapshot = ReadProcessClock();
+  const double real_wall_time_ms =
+      snapshot.enabled ? AnchoredWallTimeMilliseconds(snapshot, uv_hrtime())
+                       : static_cast<double>(real_time_millis);
   double result =
-      CurrentWallTimeMilliseconds(real_time_millis) + DateOffsetMilliseconds();
+      CurrentWallTimeMilliseconds(real_wall_time_ms) + DateOffsetMilliseconds();
   if (!std::isfinite(result) ||
       result < static_cast<double>(std::numeric_limits<int64_t>::min()) ||
       result > static_cast<double>(std::numeric_limits<int64_t>::max())) {
@@ -1473,9 +1510,11 @@ void EnableBinding(const FunctionCallbackInfo<Value>& args) {
   Environment* env = Environment::GetCurrent(args);
   RealmTimeController* controller = ResolveController(args);
   if (controller == nullptr) return;
-  if (!controller->Enable(RealWallTimeMilliseconds(env),
-                          RealMonotonicTimeNanoseconds(),
-                          env->event_loop())) {
+  const uint64_t real_monotonic_time_ns = RealMonotonicTimeNanoseconds();
+  if (!controller->Enable(
+          RealWallTimeMilliseconds(env, real_monotonic_time_ns),
+          real_monotonic_time_ns,
+          env->event_loop())) {
     env->ThrowError(
         "this Worker already has a different Realm time controller enabled");
     return;
@@ -1496,6 +1535,22 @@ void IsEnabledBinding(const FunctionCallbackInfo<Value>& args) {
   args.GetReturnValue().Set(controller->enabled());
 }
 
+void SetFreezeEnabledBinding(const FunctionCallbackInfo<Value>& args) {
+  Environment* env = Environment::GetCurrent(args);
+  RealmTimeController* controller = ResolveController(args);
+  if (controller == nullptr) return;
+  if (args.Length() < 2 || !args[1]->IsBoolean()) {
+    env->ThrowTypeError("setFreezeEnabled requires context and a boolean");
+    return;
+  }
+  if (!controller->SetFreezeEnabled(args[1]->IsTrue())) {
+    env->ThrowError(
+        "clock freezing cannot change while an external call is open");
+    return;
+  }
+  args.GetReturnValue().Set(true);
+}
+
 void BeginExternalCallBinding(const FunctionCallbackInfo<Value>& args) {
   Environment* env = Environment::GetCurrent(args);
   RealmTimeController* controller = ResolveController(args);
@@ -1506,9 +1561,11 @@ void BeginExternalCallBinding(const FunctionCallbackInfo<Value>& args) {
   }
   std::string operation;
   if (!ReadOperation(env, args, &operation)) return;
-  uint64_t token = controller->BeginExternalCall(RealWallTimeMilliseconds(env),
-                                                 RealMonotonicTimeNanoseconds(),
-                                                 std::move(operation));
+  const uint64_t real_monotonic_time_ns = RealMonotonicTimeNanoseconds();
+  uint64_t token = controller->BeginExternalCall(
+      RealWallTimeMilliseconds(env, real_monotonic_time_ns),
+      real_monotonic_time_ns,
+      std::move(operation));
   if (token == RealmTimeController::kInvalidToken) {
     env->ThrowError("failed to freeze the Worker timer clock");
     return;
@@ -1616,13 +1673,15 @@ void CommitExternalCallBinding(const FunctionCallbackInfo<Value>& args) {
     return;
   }
 
+  const uint64_t real_monotonic_time_ns = RealMonotonicTimeNanoseconds();
   if (!ReturnTransactionResult(
           env,
-          controller->CommitExternalCall(token,
-                                         function_duration_ms,
-                                         timeline_adjustment_ms,
-                                         RealWallTimeMilliseconds(env),
-                                         RealMonotonicTimeNanoseconds()))) {
+          controller->CommitExternalCall(
+              token,
+              function_duration_ms,
+              timeline_adjustment_ms,
+              RealWallTimeMilliseconds(env, real_monotonic_time_ns),
+              real_monotonic_time_ns))) {
     return;
   }
   args.GetReturnValue().Set(true);
@@ -1639,11 +1698,13 @@ void AbortExternalCallBinding(const FunctionCallbackInfo<Value>& args) {
 
   uint64_t token;
   if (!ReadToken(env, args[1], &token)) return;
+  const uint64_t real_monotonic_time_ns = RealMonotonicTimeNanoseconds();
   if (!ReturnTransactionResult(
           env,
-          controller->AbortExternalCall(token,
-                                        RealWallTimeMilliseconds(env),
-                                        RealMonotonicTimeNanoseconds()))) {
+          controller->AbortExternalCall(
+              token,
+              RealWallTimeMilliseconds(env, real_monotonic_time_ns),
+              real_monotonic_time_ns))) {
     return;
   }
   args.GetReturnValue().Set(true);
@@ -2105,9 +2166,11 @@ void GetStateBinding(const FunctionCallbackInfo<Value>& args) {
     state->Set(context, OneByteString(isolate, name), value).Check();
   };
 
-  const double real_wall_time_ms = RealWallTimeMilliseconds(env);
   const uint64_t real_monotonic_time_ns = RealMonotonicTimeNanoseconds();
+  const double real_wall_time_ms =
+      RealWallTimeMilliseconds(env, real_monotonic_time_ns);
   set("enabled", Boolean::New(isolate, controller->enabled()));
+  set("freezeEnabled", Boolean::New(isolate, controller->freeze_enabled()));
   set("frozen", Boolean::New(isolate, controller->frozen()));
   set("parked", Boolean::New(isolate, controller->parked()));
   set("generation",
@@ -2145,6 +2208,26 @@ void GetStateBinding(const FunctionCallbackInfo<Value>& args) {
   args.GetReturnValue().Set(state);
 }
 
+/**
+ * wallClockOrigin(): the unfloored Date wall clock (date offset included) at
+ * the instant perf_hooks performance.now() reads 0, before the renderer
+ * clamp.  The clock is process wide, so Worker threads read the same origin.
+ */
+void WallClockOriginBinding(const FunctionCallbackInfo<Value>& args) {
+  Environment* env = Environment::GetCurrent(args);
+  const uint64_t real_monotonic_time_ns = RealMonotonicTimeNanoseconds();
+  const double wall_ms =
+      CurrentWallTimeMilliseconds(
+          RealWallTimeMilliseconds(env, real_monotonic_time_ns)) +
+      DateOffsetMilliseconds();
+  const double performance_ns =
+      CurrentMonotonicTimeNanoseconds(real_monotonic_time_ns) +
+      PerformanceNowOffsetNanoseconds() -
+      static_cast<double>(performance::performance_process_start);
+  args.GetReturnValue().Set(wall_ms -
+                            performance_ns / kNanosecondsPerMillisecond);
+}
+
 void Initialize(Local<Object> target,
                 Local<Value> unused,
                 Local<Context> context,
@@ -2152,12 +2235,14 @@ void Initialize(Local<Object> target,
   SetMethod(context, target, "enable", EnableBinding);
   SetMethod(context, target, "disable", DisableBinding);
   SetMethod(context, target, "isEnabled", IsEnabledBinding);
+  SetMethod(context, target, "setFreezeEnabled", SetFreezeEnabledBinding);
   SetMethod(context, target, "beginExternalCall", BeginExternalCallBinding);
   SetMethod(context, target, "parkExternalCall", ParkExternalCallBinding);
   SetMethod(context, target, "requestExternalCall", RequestExternalCallBinding);
   SetMethod(context, target, "commitExternalCall", CommitExternalCallBinding);
   SetMethod(context, target, "abortExternalCall", AbortExternalCallBinding);
   SetMethod(context, target, "getState", GetStateBinding);
+  SetMethod(context, target, "wallClockOrigin", WallClockOriginBinding);
   SetMethod(context,
             target,
             "setCodeGenerationCallback",
@@ -2613,7 +2698,7 @@ bool RealmTimeController::Enable(double real_wall_time_ms,
   if (event_loop == nullptr) return false;
   if (enabled_) Disable();
   if (uv_realm_time_enable(event_loop, this) != 0) return false;
-  if (!EnableProcessClock(this)) {
+  if (!EnableProcessClock(this, real_wall_time_ms, real_monotonic_time_ns)) {
     uv_realm_time_disable(event_loop, this);
     return false;
   }
@@ -2657,7 +2742,7 @@ uint64_t RealmTimeController::BeginExternalCall(double real_wall_time_ms,
                                                 uint64_t real_monotonic_time_ns,
   std::string operation) {
   if (!enabled_) return kInvalidToken;
-  if (frames_.empty()) {
+  if (frames_.empty() && freeze_enabled_) {
     frozen_wall_time_ms_ = CurrentWallTimeMilliseconds(real_wall_time_ms);
     frozen_monotonic_time_ns_ =
         CurrentMonotonicTimeNanoseconds(real_monotonic_time_ns);
@@ -2675,7 +2760,7 @@ uint64_t RealmTimeController::BeginExternalCall(double real_wall_time_ms,
   }
   uint64_t token = NextToken();
   if (token == kInvalidToken) {
-    if (frames_.empty()) {
+    if (frames_.empty() && freeze_enabled_) {
       uv_realm_time_resume(event_loop_, this, 0);
       ResumeProcessClock(this,
                          frozen_wall_time_ms_ - real_wall_time_ms,
@@ -2729,6 +2814,15 @@ RealmTimeController::TransactionResult RealmTimeController::CommitExternalCall(
       frames_.back().committed_duration_ms + own_duration_ms;
   if (!std::isfinite(committed_duration_ms)) {
     return TransactionResult::kClockOverflow;
+  }
+
+  // Freezing off: the clock never stopped and the browser time was already
+  // spent in real time, so there is nothing to wait for or to project.
+  if (!freeze_enabled_) {
+    frames_.pop_back();
+    RememberCompletion(token, true, function_duration_ms,
+                       timeline_adjustment_ms);
+    return TransactionResult::kOk;
   }
 
   // An inner transaction never owns the process release boundary.  Its
@@ -2786,7 +2880,7 @@ RealmTimeController::TransactionResult RealmTimeController::AbortExternalCall(
   if (completed != TransactionResult::kNoActiveCall) return completed;
   if (frames_.empty()) return TransactionResult::kNoActiveCall;
   if (frames_.back().token != token) return TransactionResult::kOutOfOrder;
-  if (frames_.size() == 1) {
+  if (frames_.size() == 1 && freeze_enabled_) {
     if (!Resume(0, real_wall_time_ms, real_monotonic_time_ns)) {
       return TransactionResult::kClockOverflow;
     }
@@ -2796,15 +2890,24 @@ RealmTimeController::TransactionResult RealmTimeController::AbortExternalCall(
   return TransactionResult::kOk;
 }
 
+bool RealmTimeController::SetFreezeEnabled(bool enabled) {
+  if (!frames_.empty()) return false;
+  freeze_enabled_ = enabled;
+  return true;
+}
+
 bool RealmTimeController::Resume(double committed_duration_ms,
                                  double real_wall_time_ms,
                                  uint64_t real_monotonic_time_ns) {
-  const double wall_time_offset_ms =
-      frozen_wall_time_ms_ + committed_duration_ms - real_wall_time_ms;
   const double monotonic_time_offset_ns =
       frozen_monotonic_time_ns_ +
       committed_duration_ms * kNanosecondsPerMillisecond -
       static_cast<double>(real_monotonic_time_ns);
+  // The real wall clock is anchored to uv_hrtime, so both offsets are the
+  // same duration.  Deriving the wall one keeps double rounding on the ~1.8e12
+  // wall value from accumulating across thousands of transactions.
+  const double wall_time_offset_ms =
+      monotonic_time_offset_ns / kNanosecondsPerMillisecond;
   if (!std::isfinite(wall_time_offset_ms) ||
       !std::isfinite(monotonic_time_offset_ns) ||
       uv_realm_time_resume(event_loop_, this, committed_duration_ms) != 0) {
@@ -3081,12 +3184,14 @@ void RegisterExternalReferences(ExternalReferenceRegistry* registry) {
   registry->Register(SetClockRulesBinding);
   registry->Register(DisableBinding);
   registry->Register(IsEnabledBinding);
+  registry->Register(SetFreezeEnabledBinding);
   registry->Register(BeginExternalCallBinding);
   registry->Register(ParkExternalCallBinding);
   registry->Register(RequestExternalCallBinding);
   registry->Register(CommitExternalCallBinding);
   registry->Register(AbortExternalCallBinding);
   registry->Register(GetStateBinding);
+  registry->Register(WallClockOriginBinding);
   registry->Register(SetCodeGenerationCallbackBinding);
   registry->Register(SetUncaughtExceptionCallbackBinding);
   registry->Register(GetCodeGenerationRecordsBinding);
