@@ -31,6 +31,7 @@
 #include "include/v8-template.h"
 #include "include/v8-unwinder-state.h"
 #include "include/v8-util.h"
+#include "include/v8-rex-interceptor.h"
 #include "include/v8-wasm.h"
 #include "src/api/api-arguments.h"
 #include "src/api/api-inl.h"
@@ -8831,6 +8832,28 @@ void Proxy::MarkAsUndetectable() {
   undetectable_map->set_is_undetectable(true);
   self->set_map(i_isolate, *undetectable_map, kReleaseStore);
 }
+
+namespace internal {
+// Set by RexInterceptorReceiverScope (objects/js-objects.cc).
+thread_local Address* rex_interceptor_receiver_location = nullptr;
+}  // namespace internal
+
+namespace rex {
+
+MaybeLocal<Value> CurrentInterceptorReceiver(Isolate* v8_isolate) {
+  i::Address* location = i::rex_interceptor_receiver_location;
+  if (location == nullptr) return MaybeLocal<Value>();
+  i::Isolate* i_isolate = reinterpret_cast<i::Isolate*>(v8_isolate);
+  i::Tagged<i::Object> receiver(*location);
+  // A contextual load has the global object as receiver; script only ever
+  // sees the global proxy
+  if (i::IsJSGlobalObject(receiver)) {
+    receiver = i::Cast<i::JSGlobalObject>(receiver)->global_proxy();
+  }
+  return Utils::ToLocal(i::direct_handle(receiver, i_isolate));
+}
+
+}  // namespace rex
 
 void Proxy::Revoke() {
   auto self = Utils::OpenDirectHandle(this);

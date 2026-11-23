@@ -37,6 +37,7 @@
 #include "node_url.h"
 #include "node_watchdog.h"
 #include "util-inl.h"
+#include "v8-rex-interceptor.h"
 
 namespace node {
 namespace contextify {
@@ -614,6 +615,41 @@ Intercepted ContextifyContext::PropertyGetterCallback(
   // proxy's has trap first and throws when the name is absent.
   if (LookupReachesProxy(context, sandbox, property)) {
     return Intercepted::kNo;
+  }
+
+  // RexMirror: GetRealNamedProperty runs a sandbox accessor with the sandbox
+  // as `this`, whatever the real receiver was. When the global is read through
+  // another receiver (`new Proxy(globalThis, {}).x`, `Object.create(globalThis)
+  // .x`, `Reflect.get(globalThis, 'x', r)`), call the getter with that receiver
+  // as [[Get]] does, so brand checks such as window.document's Illegal
+  // invocation see it.
+  Local<Value> receiver;
+  if (v8::rex::CurrentInterceptorReceiver(env->isolate()).ToLocal(&receiver) &&
+      receiver != ctx->global_proxy() && receiver != sandbox) {
+    Local<Value> own_desc;
+    if (!sandbox->GetOwnPropertyDescriptor(context, property)
+             .ToLocal(&own_desc)) {
+      return Intercepted::kYes;  // exception pending
+    }
+    if (own_desc->IsObject()) {
+      Local<Object> own_desc_obj = own_desc.As<Object>();
+      if (own_desc_obj->HasOwnProperty(context, env->get_string())
+              .FromMaybe(false)) {
+        Local<Value> getter;
+        if (!own_desc_obj->Get(context, env->get_string()).ToLocal(&getter)) {
+          return Intercepted::kYes;
+        }
+        Local<Value> value = v8::Undefined(env->isolate());
+        if (getter->IsFunction() &&
+            !getter.As<Function>()
+                 ->Call(context, receiver, 0, nullptr)
+                 .ToLocal(&value)) {
+          return Intercepted::kYes;
+        }
+        args.GetReturnValue().Set(value);
+        return Intercepted::kYes;
+      }
+    }
   }
 
   TryCatchScope try_catch(env);

@@ -1283,7 +1283,34 @@ Maybe<bool> JSReceiver::OrdinaryDefineOwnProperty(
                                    should_throw);
 }
 
+// RexMirror: handle location of the receiver of the named interceptor getter
+// call in progress on this thread; read by v8::rex::CurrentInterceptorReceiver
+// (api.cc, include/v8-rex-interceptor.h).
+extern thread_local Address* rex_interceptor_receiver_location;
+
 namespace {
+
+// Publishes the receiver for the duration of one getter call; nested
+// interceptor calls (the getter running script) restore the outer one.
+class RexInterceptorReceiverScope {
+ public:
+  RexInterceptorReceiverScope(Isolate* isolate, DirectHandle<JSAny> receiver)
+      : previous_(rex_interceptor_receiver_location) {
+    // An indirect handle in the caller's scope: its location stays valid and
+    // is updated by the GC while the getter runs.
+    rex_interceptor_receiver_location =
+        handle(*receiver, isolate).location();
+  }
+  ~RexInterceptorReceiverScope() {
+    rex_interceptor_receiver_location = previous_;
+  }
+  RexInterceptorReceiverScope(const RexInterceptorReceiverScope&) = delete;
+  RexInterceptorReceiverScope& operator=(const RexInterceptorReceiverScope&) =
+      delete;
+
+ private:
+  Address* previous_;
+};
 
 MaybeHandle<JSAny> GetPropertyWithInterceptorInternal(
     LookupIterator* it, DirectHandle<InterceptorInfo> interceptor, bool* done) {
@@ -1297,6 +1324,7 @@ MaybeHandle<JSAny> GetPropertyWithInterceptorInternal(
     return isolate->factory()->undefined_value();
   }
 
+  RexInterceptorReceiverScope receiver_scope(isolate, it->GetReceiver());
   DirectHandle<JSObject> holder = it->GetHolder<JSObject>();
   PropertyCallbackArguments args(isolate, it->GetHolderForApi());
 
