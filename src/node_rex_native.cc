@@ -840,6 +840,44 @@ void IsJanusProxy(const FunctionCallbackInfo<Value>& args) {
 }
 
 /**
+ * setJanusTypeof(proxy, type): typeof proxy returns `type`; only 'undefined'
+ * (document.all, a callable JanusProxy) is supported.
+ */
+void SetJanusTypeof(const FunctionCallbackInfo<Value>& args) {
+  Environment* env = Environment::GetCurrent(args);
+  if (!args[0]->IsProxy() || !args[0].As<Proxy>()->IsJanus()) {
+    return THROW_ERR_INVALID_ARG_TYPE(env, "proxy must be a JanusProxy");
+  }
+  if (!args[1]->IsString()) {
+    return THROW_ERR_INVALID_ARG_TYPE(env, "type must be a string");
+  }
+  Utf8Value type_utf8(env->isolate(), args[1]);
+  std::string_view type(*type_utf8, type_utf8.length());
+  if (type != "undefined") {
+    return THROW_ERR_INVALID_ARG_VALUE(
+        env, "only 'undefined' is supported, got '%s'", *type_utf8);
+  }
+
+  Local<Proxy> proxy = args[0].As<Proxy>();
+  if (!proxy->IsFunction()) {
+    return THROW_ERR_INVALID_ARG_VALUE(
+        env, "typeof 'undefined' needs a callable proxy (function target)");
+  }
+  proxy->MarkAsUndetectable();
+}
+
+/**
+ * setJanusError(proxy): Error.isError(proxy) returns true afterwards.
+ */
+void SetJanusError(const FunctionCallbackInfo<Value>& args) {
+  Environment* env = Environment::GetCurrent(args);
+  if (!args[0]->IsProxy() || !args[0].As<Proxy>()->IsJanus()) {
+    return THROW_ERR_INVALID_ARG_TYPE(env, "proxy must be a JanusProxy");
+  }
+  args[0].As<Proxy>()->MarkAsError();
+}
+
+/**
  * Makes the prototype of a context's globalThis immutable, like Window.
  */
 void LockGlobalPrototype(const FunctionCallbackInfo<Value>& args) {
@@ -938,6 +976,8 @@ void Initialize(Local<Object> target,
       context, target, "getRemoteNotIntercepted", GetRemoteNotIntercepted);
   SetMethod(context, target, "JanusProxy", JanusProxy);
   SetMethod(context, target, "isJanusProxy", IsJanusProxy);
+  SetMethod(context, target, "setJanusTypeof", SetJanusTypeof);
+  SetMethod(context, target, "setJanusError", SetJanusError);
   SetMethod(context, target, "lockGlobalPrototype", LockGlobalPrototype);
   // RexMirror: 引擎错误回调在运行时由 enableEngineErrorHook 注册 (不在 snapshot 构建期间注册)
   SetMethod(context, target, "enableEngineErrorHook", EnableEngineErrorHook);
@@ -957,6 +997,8 @@ void RegisterExternalReferences(ExternalReferenceRegistry* registry) {
   registry->Register(GetRemoteNotIntercepted);
   registry->Register(JanusProxy);
   registry->Register(IsJanusProxy);
+  registry->Register(SetJanusTypeof);
+  registry->Register(SetJanusError);
   registry->Register(LockGlobalPrototype);
   registry->Register(EnableEngineErrorHook);
   registry->Register(NamedGet);

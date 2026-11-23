@@ -26,6 +26,8 @@ bool JSProxy::is_revocable() const { return IsRevocableBit::decode(flags()); }
 
 bool JSProxy::is_janus() const { return IsJanusBit::decode(flags()); }
 
+bool JSProxy::is_error() const { return IsErrorBit::decode(flags()); }
+
 bool JSProxy::IsRevoked() const { return !IsJSReceiver(handler()); }
 
 }  // namespace internal

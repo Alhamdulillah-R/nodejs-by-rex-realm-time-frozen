@@ -66,6 +66,13 @@ BUILTIN(ErrorIsError) {
 
   if (IsHeapObject(*obj)) {
     Tagged<Map> obj_map = Cast<HeapObject>(*obj)->map();
+    // RexMirror: a Janus proxy marked as error stands for a remote error.
+    if (IsJSProxy(*obj)) {
+      Tagged<JSProxy> proxy = Cast<JSProxy>(*obj);
+      if (proxy->is_janus() && proxy->is_error()) {
+        return ReadOnlyRoots(isolate).true_value();
+      }
+    }
     // DOMExceptions should return true. See
     // https://github.com/whatwg/webidl/pull/1421
     return *isolate->factory()->ToBoolean(

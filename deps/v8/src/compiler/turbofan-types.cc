@@ -353,7 +353,12 @@ Type::bitset BitsetType::Lub(MapRefLike map, JSHeapBroker* broker) {
     case JS_CLASS_CONSTRUCTOR_TYPE:
       return kClassConstructor;
     case JS_PROXY_TYPE:
-      DCHECK(!map.is_undetectable());
+      // RexMirror: Proxy::MarkAsUndetectable (document.all) makes a callable
+      // proxy undetectable.
+      if (map.is_undetectable()) {
+        DCHECK(map.is_callable());
+        return kOtherUndetectable;
+      }
       if (map.is_callable()) return kCallableProxy;
       return kOtherProxy;
     case MAP_TYPE:

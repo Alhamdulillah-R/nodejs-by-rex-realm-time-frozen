@@ -44,6 +44,7 @@
 #include "src/objects/js-generator-inl.h"
 #include "src/objects/js-iterator-helpers-inl.h"
 #include "src/objects/js-promise.h"
+#include "src/objects/js-proxy-inl.h"
 #include "src/objects/js-raw-json-inl.h"
 #include "src/objects/js-regexp-inl.h"
 #include "src/objects/js-regexp-string-iterator.h"
@@ -621,10 +622,15 @@ GetConstructorHelper(Isolate* isolate, DirectHandle<JSReceiver> receiver) {
     }
   }
   bool is_hidden_prototype = false;
-  for (PrototypeIterator it(isolate, receiver, kStartAtReceiver); !it.IsAtEnd();
-       it.AdvanceIgnoringProxies()) {
-    auto current = PrototypeIterator::GetCurrent<JSReceiver>(it);
-
+  // RexMirror: the walk used to be a PrototypeIterator, which stops at any
+  // proxy because a proxy map has a null prototype. A JanusProxy in the
+  // prototype chain (Object.create(janusFn)) therefore lost "constructor" and
+  // the type name fell back to "Object", where the real function it stands for
+  // yields "Function" (stack frame "at Function.toString" vs "at
+  // Object.toString"). Walk by hand and step through a JanusProxy into its
+  // target; every other proxy still ends the walk.
+  DirectHandle<JSReceiver> current = receiver;
+  while (true) {
     LookupIterator it_to_string_tag(
         isolate, receiver, isolate->factory()->to_string_tag_symbol(), current,
         LookupIterator::OWN_SKIP_INTERCEPTOR);
@@ -679,6 +685,18 @@ GetConstructorHelper(Isolate* isolate, DirectHandle<JSReceiver> receiver) {
       }
     }
     is_hidden_prototype = IsJSGlobalProxy(*current);
+
+    Tagged<Object> next;
+    if (IsJSProxy(*current)) {
+      auto proxy = Cast<JSProxy>(current);
+      if (!proxy->is_janus()) break;
+      next = proxy->target();
+    } else {
+      next = current->map()->prototype();
+    }
+    // null prototype / revoked proxy ends the walk
+    if (!IsJSReceiver(next)) break;
+    current = direct_handle(Cast<JSReceiver>(next), isolate);
   }
 
   return std::make_pair(MaybeHandle<JSFunction>(),

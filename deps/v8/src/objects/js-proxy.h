@@ -28,6 +28,7 @@ class JSProxy : public TorqueGeneratedJSProxy<JSProxy, JSReceiver> {
 
   V8_INLINE bool is_revocable() const;
   V8_INLINE bool is_janus() const;
+  V8_INLINE bool is_error() const;
   V8_INLINE bool IsRevoked() const;
   static void Revoke(DirectHandle<JSProxy> proxy);
 
@@ -131,6 +132,8 @@ class JSProxy : public TorqueGeneratedJSProxy<JSProxy, JSReceiver> {
   using IsRevocableBit = base::BitField<bool, 0, 1>;
   // Janus proxies: trap results are not checked against the target.
   using IsJanusBit = IsRevocableBit::Next<bool, 1>;
+  // Janus proxies only: Error.isError(proxy) returns true.
+  using IsErrorBit = IsJanusBit::Next<bool, 1>;
 
   static constexpr int kIsRevocableBit = IsRevocableBit::encode(true);
 

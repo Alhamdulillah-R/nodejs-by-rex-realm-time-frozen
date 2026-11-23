@@ -63,6 +63,7 @@
 #include "src/execution/isolate-inl.h"
 #include "src/execution/messages.h"
 #include "src/execution/microtask-queue.h"
+#include "src/execution/protectors-inl.h"
 #include "src/execution/simulator.h"
 #include "src/execution/v8threads.h"
 #include "src/execution/vm-state-inl.h"
@@ -8798,6 +8799,37 @@ bool Proxy::IsRevoked() const {
 
 bool Proxy::IsJanus() const {
   return Utils::OpenDirectHandle(this)->is_janus();
+}
+
+bool Proxy::IsMarkedAsError() const {
+  return Utils::OpenDirectHandle(this)->is_error();
+}
+
+void Proxy::MarkAsError() {
+  auto self = Utils::OpenDirectHandle(this);
+  Utils::ApiCheck(self->is_janus(), "v8::Proxy::MarkAsError",
+                  "Only Janus proxies can be marked as errors");
+  self->set_flags(self->flags() | i::JSProxy::IsErrorBit::encode(true));
+}
+
+void Proxy::MarkAsUndetectable() {
+  auto self = Utils::OpenDirectHandle(this);
+  i::Isolate* i_isolate = i::Isolate::Current();
+  EnterV8NoScriptNoExceptionScope api_scope(i_isolate);
+  i::HandleScope scope(i_isolate);
+  // Same rule as ObjectTemplate::MarkAsUndetectable: the compilers type every
+  // undetectable receiver as callable.
+  Utils::ApiCheck(i::IsCallable(*self), "v8::Proxy::MarkAsUndetectable",
+                  "Undetectable proxies must be callable");
+  i::DirectHandle<i::Map> map(self->map(), i_isolate);
+  if (map->is_undetectable()) return;
+  if (i::Protectors::IsNoUndetectableObjectsIntact(i_isolate)) {
+    i::Protectors::InvalidateNoUndetectableObjects(i_isolate);
+  }
+  i::DirectHandle<i::Map> undetectable_map =
+      i::Map::Copy(i_isolate, map, "undetectable Proxy");
+  undetectable_map->set_is_undetectable(true);
+  self->set_map(i_isolate, *undetectable_map, kReleaseStore);
 }
 
 void Proxy::Revoke() {

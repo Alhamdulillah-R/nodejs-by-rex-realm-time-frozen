@@ -45,6 +45,25 @@ class V8_EXPORT Proxy : public Object {
    */
   bool IsJanus() const;
 
+  /**
+   * Marks this Janus proxy as an error: Error.isError(proxy) returns true.
+   * The proxy must have been created by NewJanus.
+   */
+  void MarkAsError();
+
+  /**
+   * Whether MarkAsError was called on this proxy.
+   */
+  bool IsMarkedAsError() const;
+
+  /**
+   * Makes this callable proxy undetectable like document.all: typeof is
+   * "undefined", it is falsy and loosely equals null / undefined.
+   * Must run before script sees the proxy: optimized code that already
+   * embedded it keeps the old typeof.
+   */
+  void MarkAsUndetectable();
+
   V8_INLINE static Proxy* Cast(Value* value) {
 #ifdef V8_ENABLE_CHECKS
     CheckCast(value);
