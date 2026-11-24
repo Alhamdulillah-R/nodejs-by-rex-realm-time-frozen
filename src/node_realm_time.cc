@@ -1145,6 +1145,7 @@ bool PerformControllerPost(Environment* env,
                             std::string_view body,
                             uint64_t token,
                             uint64_t generation,
+                            bool freeze,
                             ControllerHttpResponse* result) {
   NativeSocket socket_handle = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
   if (socket_handle == kInvalidSocket) {
@@ -1188,6 +1189,9 @@ bool PerformControllerPost(Environment* env,
   request.append("Content-Type: application/json\r\n");
   request.append("Connection: close\r\n");
   request.append("X-Rex-Realm-Park-Ack: 1\r\n");
+  // 0 = setFreezeEnabled(false): the clock keeps running, so the Controller
+  // must not hard-suspend the other threads of this process.
+  request.append("X-Rex-Realm-Freeze: ").append(freeze ? "1" : "0").append("\r\n");
   request.append("X-Rex-Realm-Token: ")
       .append(std::to_string(token))
       .append("\r\n");
@@ -1628,6 +1632,7 @@ void RequestExternalCallBinding(const FunctionCallbackInfo<Value>& args) {
                              body,
                              token,
                              TokenGeneration(token),
+                             controller->freeze_enabled(),
                              &response)) {
     return;
   }
