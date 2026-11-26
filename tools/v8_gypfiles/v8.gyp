@@ -1475,6 +1475,9 @@
         '<!@pymod_do_main(GN-scraper "<(V8_ROOT)/BUILD.gn"  "\\"v8_libbase.*?sources = ")',
       ],
 
+      # src/base/ieee754.cc uses llvm-libc's math (//third_party/llvm-libc:headers)
+      'include_dirs': ['<(V8_ROOT)/third_party/llvm-libc/src'],
+      'defines': ['LIBC_NAMESPACE=__llvm_libc_cr'],
       'dependencies': [
         'v8_headers',
         'abseil.gyp:abseil',
