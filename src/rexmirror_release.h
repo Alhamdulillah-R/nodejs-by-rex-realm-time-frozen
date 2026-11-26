@@ -12,9 +12,10 @@
 // start when the two records disagree.
 // Strings are UTF-8; non-ASCII bytes are written as escapes so the result does
 // not depend on the compiler's source charset (\xc3\xb9 is "u with grave").
-#define REXMIRROR_RELEASE_SERIAL 3
-#define REXMIRROR_RELEASE_LYRIC "Sais-tu o\xc3\xb9 fleurissent les citronniers?"
-#define REXMIRROR_RELEASE_SONG "Mignon"
-#define REXMIRROR_RELEASE_DATE "2026-11-06"
+#define REXMIRROR_RELEASE_SERIAL 4
+#define REXMIRROR_RELEASE_LYRIC \
+  "I can't afford a carriage, But you'll look sweet upon the seat"
+#define REXMIRROR_RELEASE_SONG "Daisy Bell"
+#define REXMIRROR_RELEASE_DATE "2026-11-25"
 
 #endif  // SRC_REXMIRROR_RELEASE_H_
